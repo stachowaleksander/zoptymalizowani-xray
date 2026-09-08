@@ -1,0 +1,64 @@
+# Profil mapowania firmy syntetycznej.
+#
+# Nagłówki kolumn są celowo „klienckie" — polskie, bez diakrytyki, jak w eksporcie
+# z systemu. Gdyby generator zapisywał kolumny jako `date`, `unit`, `amount`, profil
+# byłby odwzorowaniem tożsamościowym i demonstracja nie dowiodłaby ani ZOP-TECH-01
+# pkt 10.3, ani kryterium odbioru 8.1: mapowanie przechodziłoby, nie mapując niczego.
+#
+# Kierunek zapisu: pole kontraktu -> kolumna klienta. Przy zapisie odwrotnym niewyrażalne
+# byłoby przypisanie jednej kolumny do dwóch pól (D-C), a wyrażalne stałoby się przypisanie
+# dwóch kolumn do jednego pola (D-B), które jest zakazane.
+
+profile_id: firma-syntetyczna
+profile_version: 1
+
+dataset_id: firma-syntetyczna
+organization_timezone: Europe/Warsaw
+
+columns:
+  ACTIVITY:
+    date: Miesiac
+    unit: Komorka
+    product: Usluga
+    volume: Liczba_wykonan
+    revenue: Przychod_netto
+
+  COST:
+    date: Miesiac
+    unit: Komorka
+    category: Rodzaj_kosztu
+    amount: Kwota
+
+  RESOURCE:
+    date: Miesiac
+    unit: Komorka
+    resource: Zasob
+    available: Godziny_dostepne
+    used: Godziny_wykorzystane
+    cost: Koszt_zasobu
+
+  PROCESS:
+    case_id: Nr_sprawy
+    stage: Etap
+    start: Poczatek
+    end: Koniec
+    unit: Komorka
+
+  PLAN:
+    date: Miesiac
+    unit: Komorka
+    metric: Wskaznik
+    target: Wartosc_planu
+
+# Deklaracja zgodności definicji miar planu — rozstrzygnięcie B-04.
+#
+# Pusta celowo: żaden test diagnostyczny nie jest jeszcze zaimplementowany, więc nie
+# istnieje miara, z którą można by zadeklarować zgodność. Wpisanie czegokolwiek byłoby
+# wymyśleniem odpowiednika, którego karta nie ustanawia (zasada 1).
+#
+# Konsekwencja jest udokumentowana i dziś nieszkodliwa: PLAN firmy syntetycznej nie może
+# posłużyć jako reference_type = plan_budget. Raport mapowania ogłasza to wprost, zamiast
+# zostawiać do wywnioskowania z pustej listy.
+#
+# Pierwszy wpis pojawi się razem z ZOP-XR-FIN-01.
+plan_metrics: []
