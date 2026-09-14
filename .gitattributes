@@ -1,0 +1,4 @@
+# Pliki *.py zawsze z LF w drzewie roboczym, niezależnie od core.autocrlf.
+# Bajty tych plików wchodzą do odcisku wykonania (wpis DT-22): ten sam commit ma dawać
+# ten sam odcisk na każdej maszynie. Zasięg celowo wąski — tylko *.py wchodzą do odcisku.
+*.py text eol=lf
