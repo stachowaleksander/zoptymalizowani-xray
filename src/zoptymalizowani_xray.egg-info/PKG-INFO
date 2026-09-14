@@ -1,9 +1,0 @@
-Metadata-Version: 2.4
-Name: zoptymalizowani-xray
-Version: 0.1.0
-Summary: X-Ray — silnik diagnostyczny organizacji. Fundament ZOP-TECH-01.
-Requires-Python: >=3.13
-Requires-Dist: pandas>=3.0
-Requires-Dist: pydantic>=2.13
-Requires-Dist: openpyxl>=3.1
-Requires-Dist: pyarrow>=25.0

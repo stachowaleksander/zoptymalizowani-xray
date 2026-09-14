@@ -102,16 +102,56 @@ def skrot_pliku(sciezka: Path) -> str:
     return blake2b(sciezka.read_bytes(), digest_size=16).hexdigest()
 
 
-def test_ten_sam_seed_daje_identyczne_pliki(tmp_path: Path) -> None:
-    """Porównujemy skróty **zawartości plików**, nie ramek.
+def _arkusze(sciezka: Path) -> list[str]:
+    with pd.ExcelFile(sciezka) as skoroszyt:
+        return list(skoroszyt.sheet_names)
 
-    Porównanie w pamięci przeszłoby także wtedy, gdyby zapis wprowadzał zależność
-    od kolejności.
+
+def _raport_bez_sciezki(raport) -> dict:  # noqa: ANN001 — ImportReport
+    """Raport importu bez ``source_path`` — jedynego pola zależnego od katalogu."""
+    return raport.model_dump(exclude={"source": {"source_path"}})
+
+
+def test_ten_sam_seed_daje_te_same_dane(tmp_path: Path) -> None:
+    """Powtarzalność generatora (kryterium 8.6): CSV sprawdzamy bajtami, XLSX treścią.
+
+    Ta asymetria jest zamierzona (wpis DT-23):
+
+    - **CSV** nie osadza czasu, więc identyczność bajtów jest tu najostrzejszym uczciwym
+      sprawdzeniem — łapie także zależność zapisu od kolejności, której porównanie ramek
+      w pamięci by nie złapało.
+    - **XLSX** zapisuje w ``docProps/core.xml`` datę utworzenia i modyfikacji, a w archiwum
+      ZIP daty wpisów, z dokładnością do sekundy. Dwa zapisy tych samych danych różnią się
+      bajtami, gdy przypadną w różnych sekundach — poprzednia wersja tego testu żądała
+      identycznych bajtów i była niestabilna. Według DT-12 „ta sama zawartość" to treść
+      rekordów, nie bajty pliku. XLSX porównujemy więc skrótem treści z raportu importu
+      (tą samą postacią kanoniczną, z której liczony jest ``run_id``), całym raportem
+      importu oraz strukturą pliku: nazwami arkuszy i kolejnością nagłówków. Tych dwóch
+      raport nie niesie — ``source_sheet`` przy domyślnym arkuszu to ``None``,
+      a ``applied_columns`` idą według kontraktu — a zmianę struktury mapowanie mogłoby
+      połknąć.
     """
     a = generate(tmp_path / "a", seed=ZIARNO, **MALA)
     b = generate(tmp_path / "b", seed=ZIARNO, **MALA)
+    assert set(a.files) == set(b.files)
     for tabela in a.files:
-        assert skrot_pliku(a.files[tabela]) == skrot_pliku(b.files[tabela]), tabela
+        plik_a, plik_b = a.files[tabela], b.files[tabela]
+        if plik_a.suffix == ".csv":
+            assert skrot_pliku(plik_a) == skrot_pliku(plik_b), tabela
+            continue
+
+        assert plik_a.suffix == ".xlsx", tabela
+        assert _arkusze(plik_a) == _arkusze(plik_b), tabela
+        naglowki_a = list(pd.read_excel(plik_a, nrows=0).columns)
+        naglowki_b = list(pd.read_excel(plik_b, nrows=0).columns)
+        assert naglowki_a == naglowki_b, tabela
+
+        wynik_a, _ = wczytaj(plik_a, tabela)
+        wynik_b, _ = wczytaj(plik_b, tabela)
+        assert wynik_a.report.content_digest == wynik_b.report.content_digest, tabela
+        assert _raport_bez_sciezki(wynik_a.report) == _raport_bez_sciezki(wynik_b.report), (
+            tabela
+        )
 
 
 def test_inny_seed_daje_inne_dane_o_tej_samej_strukturze(tmp_path: Path) -> None:

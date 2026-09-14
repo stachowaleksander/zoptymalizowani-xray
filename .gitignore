@@ -7,3 +7,6 @@ data/
 dane_klienta/
 .DS_Store
 .idea/
+
+# Metadane budowania generowane przez pip install -e . — nie należą do repozytorium.
+*.egg-info/

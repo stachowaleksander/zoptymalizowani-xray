@@ -58,9 +58,16 @@ a nie awarią importu.
 """
 
 from xray.ingest.reader import LoadResult, load_table
-from xray.ingest.report import ImportReport, Rejection, RejectionCategory, SourceRef
+from xray.ingest.report import (
+    AmbiguousLocalTime,
+    ImportReport,
+    Rejection,
+    RejectionCategory,
+    SourceRef,
+)
 
 __all__ = [
+    "AmbiguousLocalTime",
     "ImportReport",
     "LoadResult",
     "Rejection",

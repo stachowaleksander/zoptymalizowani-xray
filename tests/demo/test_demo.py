@@ -81,7 +81,7 @@ def test_profil_wchodzi_do_tozsamosci_przebiegu(tmp_path: Path) -> None:
 def test_wersja_tozsamosci_jest_per_rodzaj_rekordu(tmp_path: Path) -> None:
     """Reguła z DT-14, sprawdzona na prawdziwym przebiegu, nie tylko jednostkowo."""
     wynik = run_demo(tmp_path, **MALA)
-    assert wynik.run.identity_algorithm_version == RUN_IDENTITY_VERSION == "2"
+    assert wynik.run.identity_algorithm_version == RUN_IDENTITY_VERSION == "3"
     assert wynik.findings[0].identity_algorithm_version == "1"
 
 
@@ -144,3 +144,28 @@ def test_dwa_przebiegi_daja_ten_sam_wynik(tmp_path: Path) -> None:
     assert a.run.run_id == b.run.run_id
     assert a.findings == b.findings
     assert a.run.profile_digest == b.run.profile_digest
+
+
+def test_wykonanie_ma_odcisk_niezalezny_od_czasu(tmp_path: Path) -> None:
+    """Dwa uruchomienia demonstracji w jednym procesie: ten sam kod i środowisko, więc ten
+    sam odcisk — mimo innego executed_at (DT-21)."""
+    from xray.store import FingerprintStatus
+
+    a = run_demo(tmp_path / "a", **MALA)
+    b = run_demo(tmp_path / "b", **MALA)
+    assert a.execution.fingerprint_status is FingerprintStatus.KNOWN
+    assert a.execution.execution_fingerprint == b.execution.execution_fingerprint
+    assert "odcisk wykonania" in opisz(a)
+
+
+def test_raport_importu_oglasza_strefe_i_licznik_niejednoznacznych(tmp_path: Path) -> None:
+    """B-07: licznik godzin niejednoznacznych jest ogłaszany zawsze, także gdy wynosi 0.
+
+    Generator zostaje naiwny, więc na firmie syntetycznej nic nie jest przeliczane.
+    """
+    wynik = run_demo(tmp_path, **MALA)
+    for tabela in wynik.tables:
+        assert tabela.load.report.organization_timezone == "Europe/Warsaw"
+        assert tabela.load.report.timestamps_converted == 0
+        assert tabela.load.report.ambiguous_local_time_count == 0
+    assert "godzin niejednoznacznych: 0" in opisz(wynik)

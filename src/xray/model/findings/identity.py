@@ -142,11 +142,15 @@ _ALGORITHMS: dict[str, Any] = {
     # skrótu — dlatego wskazuje tę samą. Wersja mówi „jak policzono tożsamość tego
     # rodzaju rekordu", a na to składa się i co hashujemy, i czym.
     "2": _compute_id_v1,
+    # Wersja 3 — znowu kształt krotki, nie funkcja: wejście RunRef zyskało jawne
+    # zestawienie odrzuceń, a wejścia sortuje się po pełnej postaci kanonicznej.
+    "3": _compute_id_v1,
 }
 """Rejestr wersji algorytmu tożsamości.
 
-Dziś jest jedna wersja, więc rozgałęzienia faktycznie nie ma. Jest natomiast **miejsce**,
-w którym powstanie: gdy dojdzie wersja 2, stare rekordy nadal będą sprawdzane wersją 1,
+Wszystkie wersje wskazują dziś tę samą funkcję skrótu — różnią się kształtem krotki
+rodzaju rekordu, który je deklaruje. Rejestr jest miejscem, w którym powstanie
+rozgałęzienie, gdy zmieni się sama funkcja: stare rekordy będą wtedy sprawdzane wersją,
 którą same wskazują, zamiast być masowo odrzucane.
 """
 

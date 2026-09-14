@@ -1,6 +1,30 @@
-# Implementuje ZOP-TECH-01 v0.1 pkt 5.4 (trwały zapis FINDINGS) oraz konwencję z CLAUDE.md
-# (SQLite jako magazyn kanoniczny).
+# Implementuje ZOP-TECH-01 v0.1 pkt 5.4 (trwały zapis FINDINGS), konwencję z CLAUDE.md
+# (SQLite jako magazyn kanoniczny) oraz invariant wykonań z wpisu DT-21.
 """Schemat magazynu i projekcja kolumn.
+
+## Klucze wynikają z invariantu, nie odwrotnie
+
+| Tabela | Klucz | Co z niego wynika |
+| --- | --- | --- |
+| ``runs`` | ``run_id`` | przebieg: na jakich danych; kolumny wyliczalne z ``run_id`` |
+| ``executions`` | ``execution_id``, ``UNIQUE (run_id, execution_fingerprint)`` | invariant |
+| ``findings`` | ``(execution_id, finding_id)`` | wynik należy do konkretnego wykonania |
+
+``execution_id`` powstaje z ``run_id + execution_fingerprint + result_digest``. Zapis
+wykonania to ``INSERT … ON CONFLICT(execution_id) DO NOTHING``:
+
+- ten sam odcisk i ta sama treść → ten sam ``execution_id`` → brak operacji,
+- ten sam odcisk i inna treść → nowy ``execution_id``, ale naruszone
+  ``UNIQUE (run_id, execution_fingerprint)`` → błąd ograniczenia, czyli sprzeczność,
+- inny odcisk → nowy wiersz.
+
+Rozstrzyga **baza**, a nie ``if`` w kodzie: nie da się zapisać dwóch różnych wyników dla tego
+samego przebiegu i odcisku, nawet omijając ``FindingStore``.
+
+**Nieznany odcisk** to ``NULL``. SQLite traktuje ``NULL``-e w ``UNIQUE`` jako różne, więc
+wiele wykonań o nieznanym odcisku współistnieje — kontrola determinizmu jest dla nich
+wyłączona, a ``fingerprint_status = 'unknown'`` mówi to wprost. ``CHECK`` pilnuje, żeby
+status i obecność odcisku się nie rozjechały.
 
 ## Payload jest rekordem, kolumny są indeksem
 
@@ -36,16 +60,31 @@ CREATE TABLE IF NOT EXISTS runs (
     dataset_id                 TEXT NOT NULL,
     contract_version           TEXT NOT NULL,
     identity_algorithm_version TEXT NOT NULL,
-    input_digest               TEXT NOT NULL,
-    provenance                 TEXT NOT NULL,
-    executed_at                TEXT
+    input_digest               TEXT NOT NULL
+)
+"""
+
+DDL_EXECUTIONS = """
+CREATE TABLE IF NOT EXISTS executions (
+    execution_id               TEXT PRIMARY KEY,
+    run_id                     TEXT NOT NULL REFERENCES runs(run_id),
+    execution_fingerprint      TEXT,
+    fingerprint_status         TEXT NOT NULL,
+    result_digest              TEXT NOT NULL,
+    fingerprint_basis          TEXT NOT NULL,
+    code_provenance            TEXT NOT NULL,
+    input_provenance           TEXT NOT NULL,
+    executed_at                TEXT,
+    UNIQUE (run_id, execution_fingerprint),
+    CHECK ((fingerprint_status = 'known') = (execution_fingerprint IS NOT NULL))
 )
 """
 
 DDL_FINDINGS = """
 CREATE TABLE IF NOT EXISTS findings (
+    execution_id               TEXT NOT NULL REFERENCES executions(execution_id),
     finding_id                 TEXT NOT NULL,
-    run_id                     TEXT NOT NULL REFERENCES runs(run_id),
+    run_id                     TEXT NOT NULL,
     test_id                    TEXT NOT NULL,
     scope_label                TEXT NOT NULL,
     period_start               TEXT NOT NULL,
@@ -55,13 +94,18 @@ CREATE TABLE IF NOT EXISTS findings (
     identity_algorithm_version TEXT NOT NULL,
     identity_canonical         TEXT NOT NULL,
     payload                    TEXT NOT NULL,
-    PRIMARY KEY (finding_id, run_id)
+    PRIMARY KEY (execution_id, finding_id)
 )
 """
 
 DDL_FINDINGS_INDEX = """
 CREATE INDEX IF NOT EXISTS findings_by_test
     ON findings (test_id, period_start, period_end)
+"""
+
+DDL_FINDINGS_BY_FINDING = """
+CREATE INDEX IF NOT EXISTS findings_by_finding
+    ON findings (finding_id)
 """
 
 
@@ -72,22 +116,32 @@ def connect(path: str | Path) -> sqlite3.Connection:
     """
     polaczenie = sqlite3.connect(path)
     polaczenie.row_factory = sqlite3.Row
-    # Klucz obcy findings → runs ma być egzekwowany: wynik bez przebiegu byłby wynikiem
-    # bez śladu, na jakich danych powstał.
+    # Klucze obce findings → executions → runs mają być egzekwowane: wynik bez wykonania
+    # i wykonanie bez przebiegu byłyby śladem bez odpowiedzi, na jakich danych i jakim
+    # kodem powstały.
     polaczenie.execute("PRAGMA foreign_keys = ON")
-    for ddl in (DDL_RUNS, DDL_FINDINGS, DDL_FINDINGS_INDEX):
+    for ddl in (
+        DDL_RUNS,
+        DDL_EXECUTIONS,
+        DDL_FINDINGS,
+        DDL_FINDINGS_INDEX,
+        DDL_FINDINGS_BY_FINDING,
+    ):
         polaczenie.execute(ddl)
     polaczenie.commit()
     return polaczenie
 
 
-def finding_columns(record: FindingRecord, run_id: str) -> dict[str, Any]:
+def finding_columns(
+    record: FindingRecord, run_id: str, execution_id: str
+) -> dict[str, Any]:
     """Wylicza projekcję kolumn z rekordu.
 
     Jedyne miejsce, w którym powstają wartości kolumn. Dzięki temu kolumna nie może
     powiedzieć czegoś, czego nie mówi ``payload``.
     """
     return {
+        "execution_id": execution_id,
         "finding_id": record.finding_id,
         "run_id": run_id,
         "test_id": record.test_id,

@@ -275,18 +275,21 @@ def test_odmowa_i_wynik_maja_ten_sam_finding_id(tmp_path: Path) -> None:
 
 def test_historia_pokazuje_odmowe_i_uzupelnienie(tmp_path: Path) -> None:
     """Ślad ma mówić, że w przebiegu 1 nie było czym liczyć."""
+    from xray.store import ExecutionRef
+
     bez = wczytaj(tmp_path, BEZ_REVENUE)
     pelny = wczytaj(tmp_path, PELNY, "pelny.csv")
     magazyn = FindingStore(connect(":memory:"))
+    wykonanie = ExecutionRef.capture()
 
     pierwszy = RunRef.create(dataset_id=ZBIOR, reports=[bez.report])
     drugi = RunRef.create(dataset_id=ZBIOR, reports=[pelny.report])
-    magazyn.save_run(pierwszy, uruchom(bez))
-    magazyn.save_run(drugi, uruchom(pelny))
+    magazyn.save_run(pierwszy, uruchom(bez), wykonanie)
+    magazyn.save_run(drugi, uruchom(pelny), wykonanie)
 
     historia = magazyn.history(uruchom(bez)[0].finding_id)
     assert len(historia) == 2
-    assert {r.status for _, r in historia} == {
+    assert {r.status for _, _, r in historia} == {
         LogicalStatus.TEST_BLOCKED,
         LogicalStatus.NO_ADVERSE_SIGNAL,
     }

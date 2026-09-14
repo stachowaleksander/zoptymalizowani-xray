@@ -33,6 +33,7 @@ from typing import Any, Self
 import yaml
 from pydantic import BaseModel, ConfigDict, model_validator
 
+from xray.ingest.timezone import load_organization_zone
 from xray.model import TABLES
 from xray.model.findings.identity import compute_id
 
@@ -99,6 +100,14 @@ class MappingProfile(BaseModel):
     def _check_profil(self) -> Self:
         if not self.dataset_id.strip():
             raise ValueError("dataset_id nie może być pusty")
+
+        # Strefa jest deklaracją, według której ingest/ przelicza znaczniki czasu
+        # (wpis DT-05). Błędna nazwa ujawniłaby się dopiero przy pierwszym znaczniku
+        # ze strefą — sprawdzamy ją przy wczytaniu profilu, tym samym źródłem reguł.
+        try:
+            load_organization_zone(self.organization_timezone)
+        except ValueError as blad:
+            raise ValueError(f"organization_timezone: {blad}") from blad
 
         nieznane_tabele = [t for t in self.columns if t not in TABLES]
         if nieznane_tabele:

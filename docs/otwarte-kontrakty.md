@@ -32,7 +32,64 @@ Brak wpisów otwartych.
 
 ## Sekcja B — nowe otwarte kontrakty
 
-Brak wpisów otwartych.
+### B-07 — jesienna zmiana czasu: dwa instanty, jedna lokalna godzina
+
+**Dokument i miejsce:** DT-05, wariant A zatwierdzony 2026-09-14 (konwersja znaczników ze
+strefą na czas lokalny organizacji wg `organization_timezone` z profilu), wobec zasady 5
+z CLAUDE.md oraz uzasadnienia samego wariantu A: nie wolno tracić informacji kompletnej.
+Konsumenci skutku: przyszłe miary czasu etapów w ZOP-XR-PROC-01 i ZOP-XR-PROC-02.
+
+**Na czym polega niejednoznaczność:** w `Europe/Warsaw` ostatniej niedzieli października
+godzina 02:00–02:59 czasu lokalnego występuje dwa razy:
+
+| Instant źródłowy | Czas lokalny |
+| --- | --- |
+| `2026-10-25T00:30Z` | 02:30 czasu letniego (UTC+02:00) |
+| `2026-10-25T01:30Z` | 02:30 czasu zimowego (UTC+01:00) |
+
+Po konwersji na naiwny czas lokalny oba dają `2026-10-25 02:30` — dwa różne instanty,
+jedna wartość. Python rozróżnia je atrybutem `fold`, ale kolumna `datetime64[ns]`, której
+typ wyznacza DT-08, go gubi (sprawdzone 2026-09-14: po odczycie z ramki oba mają `fold=0`).
+Wiosną problemu nie ma: luka 02:00–02:59 nie istnieje lokalnie, a konwersja **do** czasu
+lokalnego nigdy jej nie wyprodukuje.
+
+Poza zakresem wpisu: znacznik, który przychodzi od klienta **już naiwny** i leży w tej
+godzinie, jest niejednoznaczny u źródła. Tej informacji nie tracimy, bo nigdy jej nie było.
+
+**Warianty interpretacji:**
+
+- A — scalić w ramce bez śladu.
+- B — odrzucić wiersz z własną kategorią odrzucenia.
+- C — zachować `fold` w danych.
+- D — scalić w ramce; pierwotną wartość źródłową i przesunięcie UTC czasu lokalnego zapisać
+  w raporcie importu, obok kontraktu.
+- E — nie konwertować wartości niejednoznacznych i pozwolić modelowi je odrzucić.
+
+**Konsekwencja każdego wariantu dla kodu:**
+
+- A — najprostsze; utrata nieodwracalna. Czasy etapów przechodzących przez tę godzinę mogą
+  wyjść ujemne albo zawyżone o godzinę, a żadna z ośmiu kontroli tego nie zobaczy.
+- B — nowa kategoria wchodzi do semantycznego zestawienia odrzuceń, a więc do `run_id`;
+  ginie cały rekord (`case_id`, `stage`, drugi znacznik), czyli więcej informacji niż sama
+  niejednoznaczna godzina.
+- C — niewykonalne bez zmiany typu kolumny z DT-08 (kolumna obiektowa zamiast
+  `datetime64[ns]`), a to zmienia sposób sprawdzania braku we wszystkich warstwach wyżej.
+- D — kontrakt danych bez zmian; instant jest odtwarzalny z raportu (`row_id`, pole,
+  przesunięcie). Konsument liczący czasy musi czytać raport importu, bo sama ramka tego nie
+  powie.
+- E — w praktyce B z kategorią „znacznik ze strefą", która myli przyczynę.
+
+**Propozycja robocza (do zatwierdzenia przez Michała):** wariant D. Przyjęty 2026-09-14
+jako **założenie tymczasowe**, nie decyzja. W kodzie konwersji oznaczony
+`# ASSUMPTION: B-07`. Raport importu zawsze niesie licznik godzin niejednoznacznych, także
+gdy wynosi 0 — brak pola znaczyłby jednocześnie „nie było" i „nie sprawdzaliśmy".
+
+**Co blokuje:** nazwanie konwersji bezstratną; każdą przyszłą miarę czasu trwania, która
+czyta wyłącznie ramkę (PROC-01, PROC-02) — do rozstrzygnięcia taka miara musi uwzględnić
+raport importu albo jawnie ogłosić ograniczenie.
+
+**Czego nie blokuje:** importu, konwersji pozostałych znaczników, kontroli 8, tożsamości
+przebiegu ani odcisku wykonania.
 
 ---
 

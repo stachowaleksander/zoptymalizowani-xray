@@ -119,6 +119,37 @@ wymienia. Konstrukcja jest identyczna z rozstrzygnięciem dla numeru seryjnego d
 Oznaczałoby to, że kontrakt danych dopuszcza dwa nieporównywalne typy w jednym polu,
 a walidator musiałby naprawiać coś, czego kontrakt nie powinien był wpuścić.
 
+**WYKONANIE (2026-09-14, wariant A zatwierdzony).** Przeliczenie mieszka
+w `xray.ingest.timezone`; `load_table` przyjmuje `organization_timezone`, a podaje ją
+wywołujący z profilu — `ingest/` nie importuje `mapping/`. Model nadal odrzuca znacznik ze
+strefą; dociera do niego już tylko taki, którego nie przeliczono.
+
+| Wartość | Strefa zadeklarowana | Skutek |
+| --- | --- | --- |
+| znacznik ze strefą | tak | przeliczenie na naiwny czas lokalny |
+| znacznik bez strefy | dowolnie | bez zmian, ta sama droga co dotąd |
+| znacznik ze strefą | nie | odrzucenie z kategorią `missing_timezone_declaration` |
+
+- **Własna kategoria odrzucenia, nie wspólny worek z błędami parsowania.** Kategoria wchodzi
+  do tożsamości przebiegu (zestawienie odrzuceń, DT-12), więc jest częścią kontraktu.
+  Wiersz z kilkoma wadami dostaje jedną kategorię według **kryterium, nie listy**: wygrywa
+  wada bardziej podstawowa, czyli ta, która uniemożliwia stwierdzenie następnej. Wiersz bez
+  wartości nie ma formatu; wiersz o złym formacie nie ma strefy do przeliczenia. Tak samo
+  wstawia się każdą kolejną kategorię (`_PIERWSZENSTWO` w `ingest/reader.py`).
+  Utracone wiersze tej kategorii zgłasza kontrola 2 osobną miarą
+  `rows_rejected_missing_timezone_declaration`: bez tego nie zgłaszałaby ich żadna
+  kontrola, a raport jakości pokazywałby mniej utraconych wierszy, niż jest.
+- **Reguły stref z pakietu `tzdata`, nie z systemu.** `ZoneInfo(nazwa)` najpierw sięga do
+  systemowej bazy stref; na Linuksie reguły zmiany czasu pochodziłyby wtedy spoza odcisku
+  wykonania. `tzdata` jest zależnością runtime, więc jego wersja należy do odcisku (DT-22).
+- **Nazwa strefy sprawdzana przy wczytaniu profilu** tym samym źródłem reguł — błędna
+  nazwa to `ProfileError`, a nie niespodzianka przy pierwszym znaczniku.
+- **Jesienna godzina powtórzona:** założenie tymczasowe z wpisu B-07 (wariant D). Scalamy
+  w ramce, a pierwotną wartość i przesunięcie UTC czasu lokalnego zapisujemy w
+  `ImportReport.ambiguous_local_times`. Licznik jest ogłaszany zawsze, także gdy wynosi 0.
+- **Generator zostaje naiwny;** konwersję pokrywa osobna fixture w
+  `tests/ingest/test_timezone.py`.
+
 ---
 
 ## DT-06. Kanonizacja braku, ale nie zera
@@ -311,6 +342,21 @@ nikt później nie odtworzy.
 to `ConflictingRun`, a nie nadpisanie — bo znaczyłby, że ten sam skrót wejścia dał inny
 wynik, czyli że coś w przepływie nie jest deterministyczne.
 
+**AKTUALIZACJA 2026-09-14 (wpis DT-21).** Zasada zostaje: wynik nie jest kluczowany samym
+`finding_id`, historia wyniku przez przebiegi jest zachowana, nic nie jest nadpisywane.
+Zmienia się to, **do czego** należy wynik — do wykonania przebiegu, a nie do przebiegu:
+
+| Było | Jest |
+| --- | --- |
+| klucz `findings`: `(finding_id, run_id)` | klucz `findings`: `(execution_id, finding_id)`; `run_id` zostaje kolumną |
+| ten sam `run_id` + ta sama treść → brak operacji | ten sam `run_id` **i ten sam odcisk wykonania** + ta sama treść → brak operacji |
+| ten sam `run_id` + inna treść → `ConflictingRun` | ten sam `run_id` **i ten sam odcisk** + inna treść → `ConflictingRun`; inny odcisk → drugie legalne wykonanie |
+| `history(finding_id)` → pary `(run_id, rekord)` | trójki `(run_id, execution_id, rekord)` — wszystkie przebiegi i wszystkie wykonania |
+
+Poprzednie brzmienie „ten sam skrót wejścia dał inny wynik, czyli coś nie jest
+deterministyczne" było za mocne: ten sam skrót wejścia może legalnie dać inny wynik
+**innym kodem**. Niedeterminizm to inny wynik przy tym samym wejściu, kodzie i środowisku.
+
 ---
 
 ## DT-12. Skrót treści liczony przy imporcie, z treści rekordów
@@ -341,6 +387,8 @@ Do skrótu wchodzi wyłącznie treść rekordu.
 | `dataset_id` | tak | inny klient to inne dane |
 | `content_digest` | tak | treść wyniku od niej zależy |
 | `records_rejected` | tak | odrzucenia czyta kontrola 2 i 3; wpływają na obraz jakości |
+| zestawienie odrzuceń: kategoria + dotknięte pola + liczność | tak, **jawnie** | ta sama liczba odrzuceń z innego powodu to inny obraz jakości; jawnie, bo skrót bez treści nie powie, czym różniły się dwa przebiegi |
+| `reason` i `file_row` odrzucenia | **nie** | proza (poprawka literówki zmieniłaby `run_id`) i pozycja, nie semantyka |
 | `source_id` | **nie** | niesie nazwę pliku; nie wpływa na wynik |
 | `executed_at` | **nie** | pole audytowe; w skrócie łamałoby zasadę 3 |
 
@@ -642,3 +690,227 @@ czy `TEST_PARTIAL`), więc nie domykamy go technicznie z własnej inicjatywy.
 **Skutek dla katalogu statusów.** `LogicalStatus.TEST_PARTIAL` pozostaje wartością
 **nieosiągalną w kodzie** do czasu zbudowania `required_by_claim` (DT-18). Bramka zna jedną
 wartość i nie zgaduje drugiej.
+
+---
+
+## DT-21. Tożsamość przebiegu oddzielona od proweniencji wykonania
+
+**Decyzja (Michał, 2026-09-14):** commit SHA, drzewo gita, wydanie i lock zależności to
+**proweniencja wykonania**, a nie semantyczna tożsamość przebiegu. Do `run_id` nie wchodzą.
+`run_id` odpowiada na pytanie „na jakich danych", odcisk wykonania — „jakim kodem
+i w jakim środowisku".
+
+**Invariant:**
+
+| run_id | odcisk wykonania | wynik | skutek |
+| --- | --- | --- | --- |
+| ten sam | ten sam | ten sam | brak operacji |
+| ten sam | ten sam | inny | `ConflictingRun` |
+| ten sam | inny | dowolny | dwa legalne, niezmienne wykonania tego samego przebiegu |
+
+**Struktura, nie warunek.** Invariant wynika z kluczy tabel (`xray.store.schema`):
+
+- `runs` — klucz `run_id`; każda kolumna jest wyliczalna z `run_id`,
+- `executions` — klucz `execution_id = skrót(run_id, odcisk, skrót treści wyników)`
+  oraz `UNIQUE (run_id, execution_fingerprint)`,
+- `findings` — klucz `(execution_id, finding_id)`.
+
+Zapis wykonania to `INSERT … ON CONFLICT(execution_id) DO NOTHING`. Ten sam odcisk i ta sama
+treść dają ten sam `execution_id`, więc nic się nie dzieje. Ten sam odcisk i inna treść dają
+nowy `execution_id`, ale naruszają `UNIQUE (run_id, execution_fingerprint)` — sprzeczność
+zgłasza **baza**, także wtedy, gdy ktoś ominie `FindingStore`. Kod tłumaczy wyłącznie
+naruszenie tego jednego ograniczenia (`sqlite_errorname == "SQLITE_CONSTRAINT_UNIQUE"`) na
+`ConflictingRun`; inne naruszenia, np. dwa wyniki o tym samym `finding_id` w jednym
+wykonaniu, nie są sprzecznością przebiegu i nie są tak nazywane.
+
+Zachowanie ograniczeń sprawdzone na SQLite 3.49 przed napisaniem kodu: przy identycznym
+wstawieniu naruszone są oba ograniczenia, a `ON CONFLICT` na kluczu głównym i tak kończy się
+brakiem operacji.
+
+**Odrzucona alternatywa: `executed_at` w tożsamości przebiegu albo w odcisku.** Każde
+wykonanie miałoby inną tożsamość. Wiersz „ten sam odcisk" invariantu nigdy by się nie
+ziścił, więc kontrola determinizmu **cicho przestałaby działać — przy zielonych testach**.
+Dlatego `compute_fingerprint()` nie przyjmuje żadnego argumentu, a `executed_at` jest polem
+audytowym poza obiema tożsamościami. `RunRef` nie ma już tego pola.
+
+**Odrzucona alternatywa: commit SHA w `run_id`.** Ten sam zbiór danych przeliczony po
+poprawce komentarza byłby „innym przebiegiem", a historia wyniku mieszałaby zmianę danych ze
+zmianą kodu.
+
+**Odcisk nieznany (decyzja D5).** `execution_fingerprint = NULL`,
+`fingerprint_status = 'unknown'`, przyczyna w `fingerprint_basis`. SQLite traktuje `NULL`-e
+w `UNIQUE` jako różne, więc wiele takich wykonań współistnieje. Kontrola determinizmu jest
+dla nich wyłączona — i rekord to mówi. Przyjęte świadomie: odmowa zapisu skasowałaby wynik,
+który policzono poprawnie. `CHECK` pilnuje, żeby status i obecność odcisku się nie rozjechały.
+
+**Pochodzenie plików wejściowych należy do wykonania, ale nie do żadnej z jego tożsamości.**
+`input_provenance` (`source_id` plików) jest kolumną `executions`. Pochodzenie nie wpływa na
+wynik, więc tożsamość nie ma w nim czego widzieć. Dwie choroby, których nie wolno mylić, bo
+prowadzą kolejne decyzje w przeciwne strony:
+
+| Choroba | Mechanizm | Objaw |
+| --- | --- | --- |
+| **fałszywe zróżnicowanie** | do tożsamości wchodzi coś, co **nie** wpływa na wynik | dwa legalne wykonania tam, gdzie powinno być jedno; kontrola determinizmu nie porówna ich ze sobą i cicho słabnie |
+| **fałszywa sprzeczność** | na wynik wpływa coś, czego tożsamość **nie** widzi | ten sam klucz przy innej treści; `ConflictingRun` ogłasza niedeterminizm, którego nie ma (DT-13) |
+
+Wpuszczenie pochodzenia do tożsamości byłoby **fałszywym zróżnicowaniem**. W tym schemacie
+objaw zależy od miejsca:
+
+- **w odcisku** — CSV i XLSX dałyby dwa odciski, więc dwa legalne wykonania: objaw zgodny
+  z chorobą;
+- **wyłącznie w `execution_id`** — dwa identyfikatory przy tej samej parze
+  `(run_id, execution_fingerprint)`. `UNIQUE` na tej parze zgłosiłby błąd, więc objawem
+  byłaby sprzeczność — nie dlatego, że tożsamość czegoś nie widzi, tylko dlatego, że klucz
+  wiersza byłby drobniejszy niż ograniczenie, które go pilnuje. Mechanizm pokazuje test
+  `test_sprzecznosc_rozstrzyga_schemat_a_nie_warunek_w_kodzie`: inny `execution_id` przy tej
+  samej parze kończy się `SQLITE_CONSTRAINT_UNIQUE`.
+
+Pierwsze sformułowanie tego akapitu nazywało tylko objaw („sprzeczność przy identycznych
+wynikach"), bez choroby, i tym samym podsuwało chorobę odwrotną. Poprawione 2026-09-14.
+
+Znany skutek obecnego rozwiązania: powtórne, identyczne wykonanie z innego pliku jest
+brakiem operacji i zostaje przy pochodzeniu pierwszego.
+
+**`load_run` przy wielu wykonaniach nie wybiera.** Podnosi błąd z listą wykonań; wynik
+konkretnego wykonania czyta `load_execution`. Wybór jednego z kilku byłby zgadywaniem.
+
+---
+
+## DT-22. Zakres odcisku wykonania
+
+**Decyzja (Michał, 2026-09-14, D4 i D7):** do odcisku wchodzi to, co wpływa na wynik —
+**i nic ponadto**.
+
+| Wchodzi do odcisku | Dlaczego |
+| --- | --- |
+| SHA-256 bajtów plików `*.py` pakietu `xray` | to jest kod, który się wykonuje |
+| ścieżki tych plików **względne** wobec katalogu pakietu | ścieżka bezwzględna zmieniałaby odcisk po sklonowaniu repozytorium gdzie indziej — fałszywe zróżnicowanie, przed którym odcisk ma chronić |
+| implementacja i wersja Pythona, system, architektura | ten sam kod na dwóch systemach może dać inne wyniki zmiennoprzecinkowe; to nie sprzeczność, tylko dwa środowiska |
+| wersje dystrybucji z domknięcia zależności runtime | biblioteki, które faktycznie liczą |
+
+| Nie wchodzi — ląduje w `fingerprint_basis` jako opis | Dlaczego |
+| --- | --- |
+| `__pycache__`, `*.pyc` | artefakt interpretera, nie kod |
+| narzędzia deweloperskie (pytest, ruff i reszta spoza domknięcia runtime) | **im więcej wchodzi do odcisku, tym słabsza kontrola sprzeczności**: `pip install ruff` zmieniłby odcisk, a dwa różne wyniki z tych samych danych przestałyby być sprzecznością i stałyby się dwoma legalnymi wykonaniami |
+| skrót `pylock.toml` | to, co **zadeklarowano**; to, co **działa**, opisują wersje zainstalowane |
+| commit, drzewo gita, stan drzewa roboczego | opis kodu; przy brudnym drzewie commit jest bazą, nie opisem |
+
+To jest odwrotna strona zasady „tożsamość widzi wszystko, co wpływa na wynik": ma widzieć
+wszystko, co wpływa — i nic ponadto.
+
+**Końce linii — obserwacja bez zmian, rozstrzygnięcie zmienione (2026-09-14).**
+
+*Obserwacja:* przy `core.autocrlf=true` checkout zamienia LF na CRLF, więc bajty tego
+samego commitu różnią się między maszynami, a z nimi skrót kodu.
+
+*Pierwotne rozstrzygnięcie (wycofane):* „to nie usterka, platforma i tak należy do
+odcisku". Było za słabe. Ten sam commit na dwóch maszynach z tą samą platformą, a różnym
+`autocrlf`, dawałby dwa odciski — czyli dwa legalne wykonania zamiast kontroli determinizmu.
+
+*Obowiązujące rozstrzygnięcie:* naprawiamy u źródła. `.gitattributes` z `*.py text eol=lf`
+wymusza LF w drzewie roboczym niezależnie od `autocrlf`. Kod tożsamości **nadal nie
+normalizuje** końców linii: normalizacja w `code_manifest` byłaby drugą, równoległą
+definicją tego, co znaczy „ten sam kod", obok bajtów. Zasięg jest wąski — tylko `*.py`,
+bo tylko one wchodzą do odcisku.
+
+Stan zastany przy zmianie: indeks miał już wszystkie pliki `*.py` w LF
+(`git ls-files --eol`: 73 × `i/lf`, 13 pustych), CRLF było wyłącznie w drzewie roboczym
+(35 × `w/crlf`, 1 × `w/mixed`). Renormalizacja nie zmieniła więc żadnego blobu; zmieniło
+się drzewo robocze. Plik `*.py` zapisany z CRLF poza gitem nadal da inny odcisk — to są
+inne bajty i odcisk ma to widzieć.
+
+*Domknięcie — strażnik w testach (2026-09-14).* `.gitattributes` gwarantuje treść przy
+checkoucie, a nie przy zapisie z narzędzia. Odcisk czyta bajty z dysku, więc CRLF zapisany
+po checkoucie (edytor, formatter, skrypt) zmienia odcisk, a git tego nie pokazuje, bo
+porównuje treść po normalizacji do LF. Sprawdzone na chwilowym repozytorium: `git diff`
+jest pusty od razu, a po pierwszym `git add` także `git status` jest czysty, choć na dysku
+zostaje CRLF (`git ls-files --eol`: `i/lf w/crlf`). Sam `.gitattributes` nie domyka więc
+pętli.
+
+Domyka ją test `test_zaden_plik_odcisku_nie_ma_konca_linii_crlf`: przechodzi po plikach
+z `code_files` — tej samej funkcji, z której `code_manifest` liczy odcisk, a nie drugiej,
+równoległej liście — i wymaga, żeby żaden nie zawierał `\r\n`. Kod tożsamości nadal niczego
+nie normalizuje; strażnik tylko nie pozwala, żeby CRLF przeszedł niezauważony.
+
+**Zakres zależności runtime: nazwy z deklaracji, wersje z instalacji.**
+
+| Co | Skąd | Dlaczego |
+| --- | --- | --- |
+| nazwy korzeni domknięcia | `[project].dependencies` w `pyproject.toml`; poza repozytorium — metadane dystrybucji | to, co deklarujemy |
+| domknięcie przechodnie | `requires` kolejnych zainstalowanych dystrybucji z `importlib.metadata`; markery oblicza `packaging`; zależności dodatków (`extra == ...`) pominięte | numpy pod pandas czy et-xmlfile pod openpyxl zmieniają wynik tak samo jak pandas |
+| wersje | zainstalowane dystrybucje | to, co faktycznie działa |
+
+Domknięcie jest przechodnie (kolejka po `requires`). Na tym środowisku obejmuje
+15 dystrybucji, m.in. numpy 2.5.2, python-dateutil 2.9.0.post0, six 1.17.0, et-xmlfile 2.0.0,
+pydantic-core 2.46.5 oraz **tzdata 2026.3**. Reguły stref, według których ingest przelicza
+znaczniki (DT-05), należą do wyniku, więc wersja tzdata musi być w odcisku — i jest. Pilnuje
+tego test `test_do_odcisku_wchodzi_domkniecie_przechodnie_z_wersjami_z_instalacji`.
+
+**Dlaczego nazwy korzeni nie z metadanych instalacji — z dowodem (sprawdzone 2026-09-14).**
+
+- `src/zoptymalizowani_xray.egg-info/requires.txt` zapisany w HEAD wymienia cztery
+  zależności (pandas, pydantic, openpyxl, pyarrow), a `pyproject.toml` w **tym samym**
+  commicie deklaruje pięć, z PyYAML. Dokładnie tę czteroelementową listę zwróciło wcześniej
+  `importlib.metadata.distribution("zoptymalizowani-xray").requires`.
+- Hipoteza „szukanie po nazwie importu `yaml` zamiast nazwy dystrybucji `PyYAML`" —
+  **odpada**: czytana była lista `requires` naszej własnej dystrybucji, wyszukanej po nazwie
+  dystrybucji; PyYAML nie był wyszukiwany.
+- Hipoteza „stary `*.egg-info` z indeksu" — **zgodna z treścią, niepotwierdzalna wstecz**.
+  Na dysku są dwie kopie metadanych: `.venv/Lib/site-packages/…dist-info` oraz
+  `src/*.egg-info`, ta druga na `sys.path` przez `pythonpath = ["src"]`. Obie zostały
+  nadpisane przy ponownej instalacji, a dziś `importlib.metadata` wybiera kopię
+  z `site-packages`. Nie da się ustalić, którą czytało wtedy.
+
+Wniosek niezależny od tego, która kopia to była: metadane instalacji są migawką z chwili
+`pip install -e .`, nieaktualną po każdej zmianie `pyproject.toml`, a przy dwóch kopiach na
+ścieżce wybór zależy od kolejności `sys.path`. Dlatego nazwy korzeni pochodzą
+z `pyproject.toml`.
+
+**Ograniczenie zapisane w każdym rekordzie:** odcisk opisuje bajty plików na dysku w chwili
+liczenia, a nie w chwili importu modułów. Edycja pliku w trakcie działania procesu nie
+zostanie zauważona.
+
+**Odrzucone źródła odcisku:**
+
+- **git w locie** — wymaga gita i repozytorium przy każdym przebiegu, a drzewo liczy po
+  filtrach autocrlf, więc nie opisuje dokładnych bajtów,
+- **artefakt generowany przy budowaniu** — przy `pip install -e .` powstaje raz i nie
+  odświeża się po edycji `src/`, więc odcisk kłamałby o wykonanym kodzie,
+- **metadane pakietu** — wersja `0.1.0` nie zmienia się razem z kodem.
+
+Git zostaje jako opis w `code_provenance`, ze stanem `clean` / `dirty` / `unavailable`
+dla ścieżek `src`, `pyproject.toml` i `pylock.toml`.
+
+---
+
+## DT-23. Powtarzalność generatora: bajty dla CSV, treść dla XLSX
+
+**Problem.** `test_ten_sam_seed_daje_identyczne_pliki` porównywał skróty bajtów wszystkich
+plików generatora i padł na `cost.xlsx`, a uruchomiony osobno przechodził. Sprawdzone
+2026-09-14: dwa zapisy XLSX tej samej ramki różnią się wyłącznie `dcterms:created`
+i `dcterms:modified` w `docProps/core.xml` oraz datami wpisów archiwum ZIP — wszystko
+z dokładnością do sekundy. Test przechodził, gdy oba zapisy zmieściły się w jednej sekundzie.
+
+**Test asercjonował złą własność** — ta sama figura co w DT-16. Kryterium 8.6 mówi
+„powtarzalny generator", a DT-12 rozstrzygnął już, co znaczy „ta sama zawartość": treść
+rekordów, nie bajty pliku — CSV i XLSX o tych samych danych dają ten sam `run_id`. Żądanie
+identycznych bajtów XLSX stało w sprzeczności z własnym systemem.
+
+**Decyzja (Michał, 2026-09-14):**
+
+| Format | Asercja | Dlaczego |
+| --- | --- | --- |
+| CSV | skrót bajtów pliku | nie ma osadzonego czasu, więc bajty są najostrzejszym uczciwym sprawdzeniem |
+| XLSX | skrót treści z raportu importu + raport importu + nazwy arkuszy i kolejność nagłówków | treść wg DT-12; reszta łapie zmianę struktury pliku, którą mapowanie mogłoby połknąć |
+
+Skrót treści (`content_digest`) jest liczony z tej samej postaci kanonicznej rekordów, co
+w DT-12. Nazwy arkuszy i kolejność nagłówków są sprawdzane **wprost z pliku**, bo raport
+importu ich nie niesie: przy wczytaniu bez wskazania arkusza `source_sheet` jest `None`,
+a `applied_columns` są uporządkowane według kontraktu, nie według pliku. Test nazywa się
+teraz `test_ten_sam_seed_daje_te_same_dane`.
+
+**Odrzucona alternatywa: normalizacja metadanych XLSX** — stały `created`/`modified`
+i przepisanie dat wpisów ZIP. Wprowadza ręczne przepisywanie kontenera do generatora,
+którego jedynym konsumentem jest `ingest/`, i tworzy drugą definicję identyczności obok
+DT-12. **Wariantu połowicznego** — sam `created`/`modified` bez dat ZIP — nie robimy wcale:
+plik „prawie identyczny bajtowo" zachęca do wiary, że to bajty są gwarancją.

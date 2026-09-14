@@ -97,16 +97,75 @@ Bez tej listy łatwo założyć, że reszta już istnieje.
 
 ## Uruchomienie
 
+Wymagany Python 3.13. Kroki są te same na każdym systemie; różni się wyłącznie polecenie
+aktywacji środowiska i nazwa interpretera.
+
+**Windows — PowerShell**
+
 ```
-python -m venv .venv
-source .venv/Scripts/activate     # Git Bash na Windows
+py -3.13 -m venv .venv
+.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 pip install -e .
 ```
 
+Jeżeli PowerShell odmawia uruchomienia skryptu aktywacji, jednorazowo:
+`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
+
+**Windows — Git Bash**
+
+```
+py -3.13 -m venv .venv
+source .venv/Scripts/activate
+pip install -r requirements.txt
+pip install -e .
+```
+
+**macOS / Linux**
+
+```
+python3.13 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+pip install -e .
+```
+
+Różnica ścieżki (`Scripts` wobec `bin`) wynika z tego, jak `venv` układa katalogi na danym
+systemie. Po aktywacji wszystkie dalsze polecenia — `python`, `pytest`, `ruff` — są
+identyczne na każdej platformie.
+
 Ostatni krok instaluje pakiet `xray` w trybie edytowalnym: zmiany w `src/` działają od
 razu, a `import xray` działa w testach, skryptach i demonstracji bez ustawiania
 `PYTHONPATH`.
+
+### Środowisko wydania
+
+| Element | Gdzie |
+| --- | --- |
+| interpreter | `.python-version` (3.13.3) oraz `requires-python` w `pyproject.toml` |
+| narzędzie budowania | `setuptools==84.0.0` w `[build-system]` |
+| lock zależności | `pylock.toml` (format PEP 751, z hashami), generowany z `requirements.txt` |
+
+Instalacja dokładnie z locka:
+
+```
+pip install -r pylock.toml
+pip install -e . --no-deps
+```
+
+`pip lock` gwarantuje ważność locka **wyłącznie dla wersji Pythona i platformy, na której
+powstał** — tu: CPython 3.13 na Windows x86-64. Na macOS i Linuksie obowiązuje instalacja
+z `requirements.txt` opisana wyżej; te same przypięte wersje, bez gwarancji hashy.
+
+Po zmianie `requirements.txt` lock trzeba wygenerować ponownie:
+
+```
+pip lock -r requirements.txt -o pylock.toml
+```
+
+Każde wykonanie przebiegu zapisuje skrót `pylock.toml` jako to, co **zadeklarowano**,
+a wersje faktycznie zainstalowanych zależności runtime — w odcisku wykonania, jako to, co
+**działa** (wpisy DT-21 i DT-22 w notatce technicznej).
 
 ### Zobaczyć całość w działaniu
 

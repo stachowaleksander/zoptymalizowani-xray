@@ -7,8 +7,9 @@ w kontrakcie nie niosą śladu pochodzenia w polach; ślad żyje obok, w raporci
 
 ## Co ta warstwa robi, a czego nie
 
-Robi: odczyt pliku, przeliczenie formatów **zależnych od pliku** (numer seryjny daty
-z arkusza XLSX), bramkę kontraktu wiersz po wierszu, nadanie identyfikatorów, raport.
+Robi: odczyt pliku, przeliczenie formatów **zależnych od pliku i jego źródła** (numer
+seryjny daty z arkusza XLSX, znacznik czasu ze strefą według strefy organizacji — wpis
+DT-05), bramkę kontraktu wiersz po wierszu, nadanie identyfikatorów, raport.
 
 Nie robi: decydowania, która kolumna klienta jest którym polem kontraktu — to
 ``mapping/``. Nie robi też niczego, co wymaga widoku na cały zbiór (duplikaty, spójność
@@ -25,7 +26,14 @@ from typing import Any
 import pandas as pd
 from pydantic import ValidationError
 
-from xray.ingest.report import ImportReport, Rejection, RejectionCategory, SourceRef
+from xray.ingest.report import (
+    AmbiguousLocalTime,
+    ImportReport,
+    Rejection,
+    RejectionCategory,
+    SourceRef,
+)
+from xray.ingest.timezone import load_organization_zone, to_organization_local
 from xray.model import TABLES, get_table
 from xray.model.findings.identity import canonical_form
 from xray.model.tables.base import declared_types
@@ -187,6 +195,7 @@ def load_table(
     dataset_id: str,
     sheet: str | None = None,
     column_map: Mapping[str, str] | None = None,
+    organization_timezone: str | None = None,
 ) -> LoadResult:
     """Wczytuje jedną tabelę kontraktu z jednego pliku.
 
@@ -206,11 +215,22 @@ def load_table(
     odpowiadają polom kontraktu — wygoda dla danych syntetycznych, nie reguła dla danych
     klienta.
 
+    ``organization_timezone`` to strefa z profilu mapowania. Podaje ją wywołujący, tak jak
+    ``column_map``: ``ingest/`` nie importuje ``mapping/``. ``None`` znaczy „nie
+    zadeklarowano" — znaczniki ze strefą są wtedy odrzucane z kategorią
+    ``missing_timezone_declaration``, a nie przeliczane według zgadniętej strefy. Nieznana
+    nazwa strefy podnosi ``ValueError`` przed odczytem pliku.
+
     Kolumny spoza mapy są pomijane i wypisane w raporcie jako ``dropped_columns``. To
     zapis tego, co import zrobił; ocena mapowania należy do ``mapping/``.
     """
     path = Path(path)
     tabela = get_table(table_name)
+    strefa = (
+        load_organization_zone(organization_timezone)
+        if organization_timezone is not None
+        else None
+    )
     surowa, from_xlsx = _read_raw(path, sheet)
 
     source = SourceRef.create(
@@ -260,6 +280,8 @@ def load_table(
     przyjete: list[dict[str, Any]] = []
     identyfikatory: list[str] = []
     odrzucenia: list[Rejection] = []
+    przeliczone = 0
+    niejednoznaczne: list[AmbiguousLocalTime] = []
 
     # Skrót treści liczymy przyrostowo, w tej samej pętli, w której rekord i tak
     # przechodzi przez bramkę kontraktu. Drugie przejście po danych byłoby pracą
@@ -274,12 +296,24 @@ def load_table(
         # Ten numer klient znajdzie w swoim arkuszu — pozycja w ramce nie.
         numer_w_pliku = source.header_row + 1 + pozycja
 
-        dane = {
-            pole: _prepare_value(
-                wiersz[kolumna], field_type=rodzaje[pole], from_xlsx=from_xlsx
+        dane: dict[str, Any] = {}
+        godziny_wiersza: list[tuple[str, str, dt.datetime, str]] = []
+        # Pola w kolejności kontraktu: od niej zależy kolejność wpisów w raporcie.
+        for pole in (p for p in tabela.model_fields if p in uzyte):
+            surowa_wartosc = wiersz[uzyte[pole]]
+            wartosc = _prepare_value(
+                surowa_wartosc, field_type=rodzaje[pole], from_xlsx=from_xlsx
             )
-            for pole, kolumna in uzyte.items()
-        }
+            if rodzaje[pole] == "datetime":
+                konwersja = to_organization_local(wartosc, strefa)
+                wartosc = konwersja.value
+                if konwersja.converted:
+                    przeliczone += 1
+                if konwersja.local_utc_offset is not None:
+                    godziny_wiersza.append(
+                        (pole, str(surowa_wartosc), wartosc, konwersja.local_utc_offset)
+                    )
+            dane[pole] = wartosc
         dane.update({pole: None for pole in zmaterializowane})
         try:
             rekord = tabela(**dane)
@@ -288,13 +322,15 @@ def load_table(
                 Rejection(
                     file_row=numer_w_pliku,
                     reason=_opisz_blad(blad),
-                    category=_kategoria_bledu(blad),
+                    category=_kategoria_bledu(blad, strefa_zadeklarowana=strefa is not None),
                     fields=_pola_bledu(blad),
                 )
             )
+            niejednoznaczne += _niejednoznaczne(godziny_wiersza, numer_w_pliku, None)
             continue
 
         row_id = _row_id(table_name, source, numer_w_pliku)
+        niejednoznaczne += _niejednoznaczne(godziny_wiersza, numer_w_pliku, row_id)
         dane_rekordu = rekord.model_dump()
         przyjete.append(dane_rekordu)
         identyfikatory.append(row_id)
@@ -340,39 +376,91 @@ def load_table(
         applied_columns=zastosowane,
         materialized_empty=zmaterializowane,
         missing_key_columns=brak_kolumn_klucza,
+        organization_timezone=organization_timezone,
+        timestamps_converted=przeliczone,
+        ambiguous_local_times=tuple(niejednoznaczne),
     )
     return LoadResult(ramka, raport)
 
 
+def _niejednoznaczne(
+    godziny: list[tuple[str, str, dt.datetime, str]],
+    file_row: int,
+    row_id: str | None,
+) -> list[AmbiguousLocalTime]:
+    """Wpisy raportu dla godzin niejednoznacznych jednego wiersza (B-07)."""
+    return [
+        AmbiguousLocalTime(
+            field=pole,
+            file_row=file_row,
+            row_id=row_id,
+            source_value=zrodlowa,
+            local_value=lokalna,
+            local_utc_offset=przesuniecie,
+        )
+        for pole, zrodlowa, lokalna, przesuniecie in godziny
+    ]
+
+
 # Kody błędów Pydantic i naszych walidatorów kontraktu → kategoria odrzucenia.
 # Kody pochodzą z model/tables/base.py oraz z rdzenia Pydantic; klasyfikujemy po kodzie,
-# nigdy po treści komunikatu.
+# nigdy po treści komunikatu. `aware_timestamp` nie ma tu stałego wpisu, bo jego kategoria
+# zależy od tego, czy strefa była zadeklarowana — patrz _kategoria_bledu.
 _KATEGORIE_BLEDOW: dict[str, RejectionCategory] = {
     "missing": RejectionCategory.MISSING_VALUE,
     "blank_key": RejectionCategory.MISSING_VALUE,
     "numeric_date": RejectionCategory.INVALID_FORMAT,
-    "aware_timestamp": RejectionCategory.INVALID_FORMAT,
     "not_finite": RejectionCategory.INVALID_FORMAT,
     "extra_forbidden": RejectionCategory.OUT_OF_CONTRACT,
 }
 
+_PIERWSZENSTWO: tuple[RejectionCategory, ...] = (
+    RejectionCategory.MISSING_VALUE,
+    RejectionCategory.INVALID_FORMAT,
+    RejectionCategory.MISSING_TIMEZONE_DECLARATION,
+    RejectionCategory.OUT_OF_CONTRACT,
+)
+"""Która kategoria wygrywa, gdy wiersz ma kilka problemów naraz.
 
-def _kategoria_bledu(blad: ValidationError) -> RejectionCategory:
+**Kryterium, nie lista: wygrywa wada bardziej podstawowa** — ta, która uniemożliwia
+stwierdzenie następnej. Wiersz bez wartości nie ma formatu. Wiersz o złym formacie nie ma
+strefy do przeliczenia. Wiersz ze strefą bez deklaracji jest poprawnym zapisem, któremu
+brakuje wyłącznie kontekstu z profilu. Pole spoza kontraktu jest ostatnie, bo nie jest wadą
+żadnej wartości kontraktu i nie zasłania innych wad.
+
+Nową kategorię wstawia się, zadając to samo pytanie: czy jej wada uniemożliwia stwierdzenie
+wad już wymienionych, czy one uniemożliwiają stwierdzenie jej.
+
+Kategoria wchodzi do tożsamości przebiegu, więc kolejność jest częścią kontraktu — jej
+zmiana zmienia ``run_id`` dla wierszy z kilkoma problemami.
+"""
+
+
+def _kategoria_bledu(
+    blad: ValidationError, *, strefa_zadeklarowana: bool
+) -> RejectionCategory:
     """Rozpoznaje rodzaj odrzucenia po kodach błędów.
-
-    Gdy wiersz ma kilka problemów naraz, pierwszeństwo ma brak wartości: klient najpierw
-    musi mieć co poprawiać.
 
     Rozstrzygnięcie po **wartości wejściowej**, a nie po samym kodzie: pusta komórka
     w polu, które nie dopuszcza pustej wartości, daje kod typu (``string_type``,
     ``date_type``), bo Pydantic widzi ``None`` tam, gdzie oczekuje napisu. To nadal jest
     brak wartości, a nie nieprawidłowy format — i klient ma dostać „uzupełnij", a nie
     „popraw zapis". Pozostałe kody parsowania i typu oznaczają format.
+
+    Znacznik ze strefą, który dotarł do modelu: bez deklaracji strefy to
+    ``missing_timezone_declaration``; przy zadeklarowanej strefie konwersja go nie
+    rozpoznała, więc to zapis, którego nie umiemy przeliczyć — ``invalid_format``.
     """
     kategorie = set()
     for szczegol in blad.errors():
         kod = str(szczegol.get("type", ""))
-        if kod in _KATEGORIE_BLEDOW:
+        if kod == "aware_timestamp":
+            kategorie.add(
+                RejectionCategory.INVALID_FORMAT
+                if strefa_zadeklarowana
+                else RejectionCategory.MISSING_TIMEZONE_DECLARATION
+            )
+        elif kod in _KATEGORIE_BLEDOW:
             kategorie.add(_KATEGORIE_BLEDOW[kod])
         elif szczegol.get("input", "") is None:
             kategorie.add(RejectionCategory.MISSING_VALUE)
@@ -380,11 +468,7 @@ def _kategoria_bledu(blad: ValidationError) -> RejectionCategory:
             kategorie.add(RejectionCategory.INVALID_FORMAT)
         else:
             kategorie.add(RejectionCategory.OTHER)
-    for pierwszenstwo in (
-        RejectionCategory.MISSING_VALUE,
-        RejectionCategory.INVALID_FORMAT,
-        RejectionCategory.OUT_OF_CONTRACT,
-    ):
+    for pierwszenstwo in _PIERWSZENSTWO:
         if pierwszenstwo in kategorie:
             return pierwszenstwo
     return RejectionCategory.OTHER

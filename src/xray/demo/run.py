@@ -9,6 +9,7 @@ generator → pięć plików (CSV + XLSX)
   → ingest.load_table     → ramka w kontrakcie + raport importu
   → ValidationContext     → osiem kontroli
   → NOOP-01               → FindingRecord
+  → RunRef + ExecutionRef → przebieg (dane) i wykonanie (kod, środowisko)
   → FindingStore          → zapis i odczyt
 ```
 
@@ -19,8 +20,8 @@ ziarnem. Czytanie z ``data/`` dałoby demonstrację, która u kogoś innego nie 
 ``data/`` jest w ``.gitignore``, więc plików tam nie ma.
 
 **Jeden przebieg na pięciu tabelach.** ``RunRef`` powstaje z pięciu raportów importu
-i profilu, więc ``profile_digest`` i wersja tożsamości przebiegu ``"2"`` są tu
-przećwiczone end-to-end, a nie tylko w testach jednostkowych.
+i profilu, więc ``profile_digest`` i bieżąca wersja tożsamości przebiegu są tu przećwiczone
+end-to-end, a nie tylko w testach jednostkowych.
 
 **Raport mapowania trafia na ekran**, w szczególności ``plan_budget_note()``. Ogłoszenie,
 którego się nie drukuje, nie jest ogłoszeniem — ta sama racja, dla której
@@ -40,7 +41,7 @@ from xray.engine.base import TestReadiness
 from xray.ingest import LoadResult, load_table
 from xray.mapping import MappingProfile, MappingReport, apply_profile
 from xray.model import FindingRecord, PeriodRef, ScopeRef, get_table, table_names
-from xray.store import FindingStore, RunRef, connect
+from xray.store import ExecutionRef, FindingStore, RunRef, connect
 from xray.synth import GeneratedDataset, generate
 from xray.validation import CheckResult, ValidationContext, run_checks
 
@@ -73,6 +74,7 @@ class DemoResult:
     findings: tuple[FindingRecord, ...]
     readiness: TestReadiness
     run: RunRef
+    execution: ExecutionRef
     stored: tuple[FindingRecord, ...]
     written: bool
     store: FindingStore = field(repr=False)
@@ -113,6 +115,7 @@ def run_demo(
             nazwa,
             dataset_id=DATASET_ID,
             column_map=raport_mapowania.column_map,
+            organization_timezone=profil.organization_timezone,
         )
 
         # 3. Kontrole: stan wiedzy o tabeli, nie sama ramka.
@@ -152,15 +155,16 @@ def run_demo(
         period=okres,
     )
 
-    # 5. Zapis: jeden przebieg z pięciu raportów i profilu, transakcyjnie.
+    # 5. Przebieg — na jakich danych — i wykonanie — jakim kodem i w jakim środowisku.
+    #    Czas trafia wyłącznie do wykonania, jako pole audytowe poza odciskiem (DT-21).
     przebieg = RunRef.create(
         dataset_id=DATASET_ID,
         reports=[t.load.report for t in tabele],
         profile=profil,
-        executed_at=dt.datetime.now(),
     )
+    wykonanie = ExecutionRef.capture(executed_at=dt.datetime.now())
     magazyn = FindingStore(connect(baza))
-    zapisano = magazyn.save_run(przebieg, wyniki)
+    zapisano = magazyn.save_run(przebieg, wyniki, wykonanie)
 
     # 6. Odczyt: rekord sam potwierdza swoją tożsamość.
     return DemoResult(
@@ -170,6 +174,7 @@ def run_demo(
         findings=wyniki,
         readiness=gotowosc,
         run=przebieg,
+        execution=wykonanie,
         stored=magazyn.load_run(przebieg.run_id),
         written=zapisano,
         store=magazyn,
@@ -228,6 +233,11 @@ def opisz(wynik: DemoResult) -> str:
             f"   {tabela.table_name:<9} przyjęto {r.records_accepted:>5}, "
             f"odrzucono {r.records_rejected:>3}   skrót treści: {r.content_digest}"
         )
+        linie.append(
+            f"       strefa: {r.organization_timezone or '— (nie zadeklarowano)'}, "
+            f"przeliczono znaczników: {r.timestamps_converted}, "
+            f"godzin niejednoznacznych: {r.ambiguous_local_time_count}"
+        )
         for odrzucenie in r.rejections[:3]:
             linie.append(
                 f"       ! wiersz {odrzucenie.file_row} ({odrzucenie.category.value}): "
@@ -280,6 +290,11 @@ def opisz(wynik: DemoResult) -> str:
             f"   finding_id      : {finding.finding_id}",
         ]
 
+    wykonanie = wynik.execution
+    git = wykonanie.code_provenance
+    opis_gita = git.get("git_status", "—")
+    if "head_commit" in git:
+        opis_gita += f" (HEAD {git['head_commit'][:12]})"
     linie += [
         "",
         "6. ZAPIS I ODCZYT",
@@ -288,6 +303,9 @@ def opisz(wynik: DemoResult) -> str:
         f"   wersja tożsam.  : przebieg {wynik.run.identity_algorithm_version}, "
         f"wynik {wynik.findings[0].identity_algorithm_version}",
         f"   wejść przebiegu : {len(wynik.run.inputs)}",
+        f"   odcisk wykonania: {wykonanie.execution_fingerprint or '— (nieznany)'}",
+        f"   status odcisku  : {wykonanie.fingerprint_status.value}",
+        f"   git (opis)      : {opis_gita}",
         f"   zapisano        : {'tak' if wynik.written else 'nie (już był)'}",
         f"   odczytano       : {len(wynik.stored)} rekordów",
         f"   identyczne      : {'tak' if wynik.stored == wynik.findings else 'NIE'}",

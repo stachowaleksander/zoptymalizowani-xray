@@ -204,6 +204,8 @@ def test_zadeklarowany_brak_odrzucen_daje_zero(tmp_path: Path) -> None:
         # Generator liczy skrót własnych rekordów tak samo jak ingest/ — deklaracja ma
         # mieć autora także wtedy, gdy autorem nie jest import z pliku.
         content_digest="0" * 32,
+        timestamps_converted=0,
+        ambiguous_local_times=(),
     )
     ctx = ValidationContext(
         table=get_table("COST"), frame=ctx_z_plikiem.frame, import_reports=(pusty,)

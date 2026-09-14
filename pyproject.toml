@@ -2,22 +2,33 @@
 # Pakiet instalujemy lokalnie w trybie edytowalnym (pip install -e .), żeby `import xray`
 # działał tak samo w pytest, w demonstracji i w skryptach — bez ustawiania PYTHONPATH,
 # które inaczej wygląda w Git Bashu, a inaczej w PowerShellu.
+#
+# Środowisko wydania jest zamrożone w trzech miejscach: .python-version (interpreter),
+# [build-system] poniżej (narzędzie budowania) i pylock.toml (lock zależności). Każde
+# wykonanie przebiegu zapisuje, co z tego faktycznie zastało — wpis DT-22.
 
 [project]
 name = "zoptymalizowani-xray"
 version = "0.1.0"
 description = "X-Ray — silnik diagnostyczny organizacji. Fundament ZOP-TECH-01."
-requires-python = ">=3.13"
+requires-python = ">=3.13,<3.14"
 dependencies = [
     "pandas>=3.0",
     "pydantic>=2.13",
     "openpyxl>=3.1",
     "pyarrow>=25.0",
     "PyYAML>=6.0",
+    # Domknięcie zależności runtime dla odcisku wykonania: markery środowiskowe
+    # i normalizacja nazw dystrybucji (wpis DT-22).
+    "packaging>=26.0",
+    # Reguły stref czasowych wczytywane wprost z pakietu, a nie z systemu (wpis DT-05):
+    # ta sama wersja tzdata daje tę samą konwersję na każdym systemie i należy do odcisku.
+    "tzdata>=2026.3",
 ]
 
 [build-system]
-requires = ["setuptools>=68"]
+# Przypięte, a nie „co najmniej": to samo drzewo ma się budować tym samym narzędziem.
+requires = ["setuptools==84.0.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]

@@ -13,7 +13,7 @@ wiersz w pliku klienta.
 import datetime as dt
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, computed_field
 
 from xray.model.findings.identity import IDENTITY_ALGORITHM_VERSION, compute_id
 
@@ -112,7 +112,12 @@ class RejectionCategory(StrEnum):
     kontraktem.
 
     Kategoria wynika z **kodu błędu** podniesionego przez walidator kontraktu, a nie
-    z jego treści.
+    z jego treści. Od chwili, gdy zestawienie odrzuceń wchodzi do tożsamości przebiegu,
+    każda wartość tego katalogu jest częścią kontraktu, a nie opisem.
+
+    Wiersz z kilkoma wadami dostaje jedną kategorię: wygrywa wada bardziej podstawowa —
+    ta, która uniemożliwia stwierdzenie następnej. Kryterium i kolejność:
+    ``xray.ingest.reader._PIERWSZENSTWO``.
     """
 
     MISSING_VALUE = "missing_value"
@@ -124,8 +129,16 @@ class RejectionCategory(StrEnum):
 
     INVALID_FORMAT = "invalid_format"
     """Wartość nieprzetłumaczalna na zadeklarowany typ albo niejednoznaczna:
-    tekst w polu liczbowym, data podana liczbą, znacznik czasu ze strefą,
-    nieskończoność."""
+    tekst w polu liczbowym, data podana liczbą, nieskończoność, znacznik czasu ze strefą,
+    którego nie dało się przeliczyć mimo zadeklarowanej strefy."""
+
+    MISSING_TIMEZONE_DECLARATION = "missing_timezone_declaration"
+    """Znacznik czasu ze strefą, a profil nie zadeklarował strefy organizacji.
+
+    Osobna kategoria, a nie wspólny worek z błędami parsowania: wartość jest poprawnym
+    zapisem, brakuje deklaracji, która pozwoliłaby ją przeliczyć (wpis DT-05). Rozmowa
+    z klientem jest inna — „uzupełnij profil", a nie „popraw dane".
+    """
 
     OUT_OF_CONTRACT = "out_of_contract"
     """Wiersz niósł pole spoza kontraktu. Nie powinno się zdarzyć, bo ``mapping/``
@@ -159,6 +172,67 @@ class Rejection(BaseModel):
 
     fields: tuple[str, ...] = ()
     """Pola kontraktu, których dotyczy problem."""
+
+
+class RejectionCount(BaseModel):
+    """Liczność odrzuceń jednego rodzaju: kategoria i dotknięte pola.
+
+    Semantyczne zestawienie odrzuceń wchodzi **jawnie** do tożsamości przebiegu
+    (``xray.store.runs.RunRef``) — jawnie, a nie jako skrót, bo przy sprzeczności dwóch
+    przebiegów ma dać się odczytać, czym się różniły.
+
+    Czego tu świadomie nie ma:
+
+    - ``reason`` — proza dla człowieka; poprawka literówki w komunikacie zmieniłaby
+      ``run_id`` przy tych samych danych,
+    - ``file_row`` — pozycja wiersza nie jest semantyką odrzucenia, a dziś w dodatku nie
+      wskazuje fizycznej linii CSV (docs/analiza-wplywu-BIND-01.md, pozycja Z-3).
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    category: RejectionCategory
+    """Kategoria odrzucenia. Od chwili, gdy wchodzi do tożsamości przebiegu, jest częścią
+    kontraktu, a nie opisem."""
+
+    fields: tuple[str, ...]
+    """Dotknięte pola kontraktu, posortowane: kolejność, w jakiej walidator zgłosił błędy,
+    nie jest cechą danych."""
+
+    count: int
+    """Ile wierszy odpadło z tego powodu na tych polach."""
+
+
+class AmbiguousLocalTime(BaseModel):
+    """Znacznik, który po przeliczeniu trafił w godzinę powtórzoną przy zmianie czasu.
+
+    # ASSUMPTION: B-07 (wariant D, założenie tymczasowe z 2026-09-14). W ramce oba instanty
+    # godziny powtórzonej mają tę samą naiwną wartość lokalną; rozróżnienie żyje tutaj,
+    # obok kontraktu — tak jak pochodzenie rekordu.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    field: str
+    """Pole kontraktu, np. ``start``."""
+
+    file_row: int
+    """Numer wiersza w pliku, jak w ``Rejection.file_row``."""
+
+    row_id: str | None
+    """Identyfikator wiersza w ramce albo ``None``, gdy wiersz odrzucono z innego powodu."""
+
+    source_value: str
+    """Wartość tak, jak przyszła z pliku — z pierwotnym zapisem przesunięcia."""
+
+    local_value: dt.datetime
+    """Naiwny czas lokalny, który trafił do ramki. Dla obu instantów ten sam."""
+
+    local_utc_offset: str
+    """Przesunięcie UTC czasu lokalnego w tym instancie, np. ``+02:00`` albo ``+01:00``.
+
+    Z nim instant jest odtwarzalny: ``local_value - local_utc_offset`` daje czas UTC.
+    """
 
 
 class ImportReport(BaseModel):
@@ -264,6 +338,33 @@ class ImportReport(BaseModel):
     # a nie wadą tabeli — o ciężarze braku orzeka test, który tego pola potrzebuje.
     """
 
+    organization_timezone: str | None = None
+    """Strefa organizacji, według której przeliczono znaczniki ze strefą (wpis DT-05).
+
+    ``None`` znaczy „nie zadeklarowano": znaczniki ze strefą są wtedy odrzucane z kategorią
+    ``missing_timezone_declaration``, a nie przeliczane według zgadniętej strefy.
+    """
+
+    timestamps_converted: int
+    """Ile wartości czasowych przeliczono ze strefy na czas lokalny organizacji, licząc
+    także wiersze odrzucone później z innego powodu.
+
+    Bez wartości domyślnej celowo: raport, który jej nie poda, nie powstanie.
+    """
+
+    ambiguous_local_times: tuple[AmbiguousLocalTime, ...]
+    """Znaczniki, które po przeliczeniu trafiły w godzinę powtórzoną jesienią (B-07).
+
+    Bez wartości domyślnej celowo: brak pola znaczyłby jednocześnie „nie było"
+    i „nie sprawdzaliśmy".
+    """
+
+    @computed_field
+    @property
+    def ambiguous_local_time_count(self) -> int:
+        """Licznik godzin niejednoznacznych — ogłaszany zawsze, także gdy wynosi 0."""
+        return len(self.ambiguous_local_times)
+
     @property
     def fields_without_column(self) -> tuple[str, ...]:
         """Komplet pól kontraktu, dla których w pliku **nie było kolumny**.
@@ -285,3 +386,21 @@ class ImportReport(BaseModel):
     def rows_read(self) -> int:
         """Liczba wierszy danych odczytanych z pliku."""
         return self.records_accepted + self.records_rejected
+
+    @property
+    def rejection_summary(self) -> tuple[RejectionCount, ...]:
+        """Semantyczne zestawienie odrzuceń: ile, z jakiego powodu, na jakich polach.
+
+        Porządek po kategorii i polach, żeby zapis nie zależał od kolejności wierszy
+        w pliku. Wchodzi jawnie do tożsamości przebiegu — patrz ``RejectionCount``.
+        """
+        liczniki: dict[tuple[RejectionCategory, tuple[str, ...]], int] = {}
+        for odrzucenie in self.rejections:
+            klucz = (odrzucenie.category, tuple(sorted(set(odrzucenie.fields))))
+            liczniki[klucz] = liczniki.get(klucz, 0) + 1
+        return tuple(
+            RejectionCount(category=kategoria, fields=pola, count=liczba)
+            for (kategoria, pola), liczba in sorted(
+                liczniki.items(), key=lambda wpis: (wpis[0][0].value, wpis[0][1])
+            )
+        )

@@ -11,7 +11,7 @@ przy innej treści. Dwie różne odpowiedzi na to samo pytanie.
 
 Nadpisanie kasowałoby ślad, czego ZOP-PRI-01 rozdz. 3 zakazuje wprost dla ewaluacji
 („nie nadpisuje śladu wcześniejszej oceny"). Odrzucenie blokowałoby uprawniony przypadek.
-Dlatego wynik jest kluczowany parą ``(finding_id, run_id)``.
+Dlatego wynik należy do przebiegu — a dokładniej do jego wykonania (wpis DT-21).
 
 ## Co z tego wynika i czego nie wolno zepsuć
 
@@ -27,8 +27,9 @@ uniknąć duplikatów. Historii, raz utraconej, nikt później nie odtworzy.
 ## Tożsamość przebiegu
 
 ``run_id`` liczymy ze **skrótów treści przyjętych rekordów** dostarczonych przez raporty
-importu, liczby przyjętych i odrzuconych wierszy oraz wersji kontraktu i algorytmu
-tożsamości. Identyfikator źródła (nazwa pliku) **nie wchodzi** — patrz ``identity_of``.
+importu, liczby przyjętych i odrzuconych wierszy, **semantycznego zestawienia odrzuceń**
+oraz wersji kontraktu i algorytmu tożsamości. Identyfikator źródła (nazwa pliku) **nie
+wchodzi** — patrz ``identity_of``.
 
 Skutek jest dokładnie taki, jakiego chcemy:
 
@@ -37,17 +38,19 @@ Skutek jest dokładnie taki, jakiego chcemy:
 - przeformatowanie pliku (CSV → XLSX) bez zmiany wartości → **ten sam** ``run_id``,
   bo skrót liczy się z treści rekordów, a nie z bajtów pliku.
 
-``executed_at`` jest polem audytowym **poza tożsamością** — tak jak ``imported_at``
-w raporcie importu. Gdyby weszło do skrótu, dwa przebiegi na tych samych danych dałyby
-różne identyfikatory, co łamie zasadę 3.
+## Czego tu nie ma
+
+Kodu, środowiska i czasu. Commit, lock zależności i moment wykonania należą do
+**wykonania** przebiegu (``xray.store.executions.ExecutionRef``), a nie do jego tożsamości:
+ten sam przebieg może być wykonany wiele razy, różnym kodem, i każde z tych wykonań jest
+legalne.
 """
 
-import datetime as dt
 from collections.abc import Sequence
 
 from pydantic import BaseModel, ConfigDict
 
-from xray.ingest.report import ImportReport
+from xray.ingest.report import ImportReport, RejectionCount
 from xray.mapping.profile import MappingProfile
 from xray.model.findings.identity import (
     CONTRACT_VERSION,
@@ -57,18 +60,22 @@ from xray.model.findings.identity import (
 
 _RUN_PREFIX = "RUN"
 
-RUN_IDENTITY_VERSION = "2"
+RUN_IDENTITY_VERSION = "3"
 """Wersja tożsamości przebiegu. **Własna, nie wspólna z rekordami FINDINGS.**
 
-Podniesiona z ``"1"`` na ``"2"``, gdy krotka tożsamości przebiegu zyskała
-``profile_digest``. Krotka ``FindingRecord`` się nie zmieniła, więc jej wersja **zostaje**
-``"1"``: jedna wspólna stała unieważniałaby weryfikację rekordów, których zmiana w ogóle
-nie dotyczyła.
+Historia kształtu krotki:
 
-Dodanie pola do krotki i podniesienie wersji weszły **jedną zmianą**. W dwóch podejściach,
-z czymkolwiek uruchomionym pomiędzy, powstałyby rekordy deklarujące wersję ``"1"``, a
-policzone krotką wersji ``"2"`` — i nic nie odróżniłoby ich później od uszkodzonych. Ta
-sama klasa błędu, przed którą wersjonowanie ma chronić, wpuszczona przez kolejność kroków.
+- ``"2"`` — krotka zyskała ``profile_digest``,
+- ``"3"`` — każde wejście zyskało jawne zestawienie odrzuceń (``rejections``), a wejścia
+  są porządkowane po pełnej postaci kanonicznej zamiast po parze
+  ``(table_name, content_digest)``.
+
+Krotka ``FindingRecord`` się nie zmieniła, więc jej wersja **zostaje** ``"1"``: jedna
+wspólna stała unieważniałaby weryfikację rekordów, których zmiana w ogóle nie dotyczyła.
+
+Dodanie pola do krotki i podniesienie wersji wchodzą **jedną zmianą**. W dwóch podejściach,
+z czymkolwiek uruchomionym pomiędzy, powstałyby rekordy deklarujące starą wersję, a
+policzone nową krotką — i nic nie odróżniłoby ich później od uszkodzonych.
 """
 
 
@@ -87,6 +94,31 @@ class RunInput(BaseModel):
     content_digest: str
     records_accepted: int
     records_rejected: int
+
+    rejections: tuple[RejectionCount, ...]
+    """Semantyczne zestawienie odrzuceń: kategoria, dotknięte pola, liczność.
+
+    Bez wartości domyślnej celowo: wejście zbudowane bez zestawienia wyglądałoby jak
+    wejście bez odrzuceń, a to dwa różne fakty.
+    """
+
+
+def _input_identity(wejscie: RunInput) -> dict[str, object]:
+    """Część tożsamości pochodząca z jednego wejścia — bez ``source_id``."""
+    return {
+        "table_name": wejscie.table_name,
+        "content_digest": wejscie.content_digest,
+        "records_accepted": wejscie.records_accepted,
+        "records_rejected": wejscie.records_rejected,
+        "rejections": [
+            {
+                "category": liczba.category.value,
+                "fields": list(liczba.fields),
+                "count": liczba.count,
+            }
+            for liczba in wejscie.rejections
+        ],
+    }
 
 
 class RunRef(BaseModel):
@@ -110,9 +142,6 @@ class RunRef(BaseModel):
     contract_version: str = CONTRACT_VERSION
     identity_algorithm_version: str = RUN_IDENTITY_VERSION
 
-    executed_at: dt.datetime | None = None
-    """Kiedy wykonano przebieg. Pole audytowe, **poza tożsamością**."""
-
     @classmethod
     def identity_of(
         cls,
@@ -132,24 +161,24 @@ class RunRef(BaseModel):
         formatu zapisu nie jest zmianą danych. Pochodzenie zostaje zapisane obok, w polu
         ``inputs``, i jest dostępne przy audycie.
 
-        ``records_rejected`` wchodzi, bo wpływa: odrzucenia czyta kontrola 2 i kontrola 3,
-        a ich wynik może zablokować test. Dwa pliki o identycznej treści przyjętej, ale
-        różnej liczbie odrzuceń, dają inny obraz jakości danych.
+        Odrzucenia wchodzą **zestawieniem**, nie samą liczbą: kontrole 2 i 3 czytają
+        kategorie odrzuceń, więc dwa pliki z tą samą liczbą odrzuceń, ale z innego powodu,
+        dają inny obraz jakości danych. Proza komunikatu i numer wiersza nie wchodzą —
+        patrz ``RejectionCount``.
 
-        Wejścia porządkujemy po nazwie tabeli i skrócie treści, żeby kolejność wywołań
-        importu nie zmieniała ``run_id``.
+        ## Porządek wejść
+
+        Wejścia sortujemy po **pełnej postaci kanonicznej** każdego z nich. Dwa wejścia
+        o tym samym kluczu są wtedy identyczne, więc ich kolejność niczego nie zmienia —
+        klucz jest pełny z konstrukcji i nie trzeba go uzupełniać przy każdym nowym polu.
+
+        Wcześniejszy klucz ``(table_name, content_digest)`` nie domykał remisu. Przykład:
+        jedna tabela zasilona z dwóch plików, oba w całości odrzucone. Oba mają skrót
+        treści pustego strumienia i tę samą nazwę tabeli, a różną liczbę odrzuceń —
+        sortowanie stabilne przenosiło wtedy kolejność wywołań importu do ``run_id``.
         """
         uporzadkowane = sorted(
-            (
-                {
-                    "table_name": wejscie.table_name,
-                    "content_digest": wejscie.content_digest,
-                    "records_accepted": wejscie.records_accepted,
-                    "records_rejected": wejscie.records_rejected,
-                }
-                for wejscie in inputs
-            ),
-            key=lambda w: (w["table_name"], w["content_digest"]),
+            (_input_identity(wejscie) for wejscie in inputs), key=canonical_form
         )
         return {
             "dataset_id": dataset_id,
@@ -166,7 +195,6 @@ class RunRef(BaseModel):
         dataset_id: str,
         reports: Sequence[ImportReport],
         profile: MappingProfile | None = None,
-        executed_at: dt.datetime | None = None,
         contract_version: str = CONTRACT_VERSION,
         identity_algorithm_version: str = RUN_IDENTITY_VERSION,
     ) -> "RunRef":
@@ -201,6 +229,7 @@ class RunRef(BaseModel):
                 content_digest=raport.content_digest,
                 records_accepted=raport.records_accepted,
                 records_rejected=raport.records_rejected,
+                rejections=raport.rejection_summary,
             )
             for raport in reports
         )
@@ -225,7 +254,6 @@ class RunRef(BaseModel):
             profile_digest=profile_digest,
             contract_version=contract_version,
             identity_algorithm_version=identity_algorithm_version,
-            executed_at=executed_at,
         )
 
     @property
@@ -251,10 +279,11 @@ class RunRef(BaseModel):
         """Pełne pochodzenie wejścia, wraz z identyfikatorami źródeł.
 
         Szersze niż ``input_digest``: zawiera ``source_id``, czyli to, z jakich plików
-        dane przyszły. Nie wchodzi do skrótu — służy audytowi, nie tożsamości.
+        dane przyszły. Nie wchodzi do skrótu — służy audytowi, nie tożsamości. Zapisywane
+        przy wykonaniu, bo to wykonanie czytało konkretne pliki.
         """
         return canonical_form(
-            {"inputs": [wejscie.model_dump() for wejscie in self.inputs]}
+            {"inputs": [wejscie.model_dump(mode="json") for wejscie in self.inputs]}
         )
 
 

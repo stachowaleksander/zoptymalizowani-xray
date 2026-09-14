@@ -6,8 +6,10 @@ Produkt 3 z ZOP-TECH-01 rozdz. 7. Mapa komponentów i przepływu danych.
 (łatwiejsza w czytaniu na telefonie, przekazywana Michałowi). Gdy oba się rozjadą,
 obowiązuje ten plik.
 
-Stan na 7 września 2026: 362 testy, `ruff` czysty, `python -m xray.demo` przechodzi
-łańcuch od generatora do odczytu z magazynu.
+Testy powstają razem z kodem i towarzyszą każdej warstwie (`tests/` odpowiada układem
+`src/`). `python -m xray.demo` przechodzi łańcuch od generatora do odczytu z magazynu.
+Stan konkretnego dnia — liczbę testów, wynik `ruff`, przebieg demonstracji — zapisują
+datowane checkpointy, nie ten dokument.
 
 ---
 

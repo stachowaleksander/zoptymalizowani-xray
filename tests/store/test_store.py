@@ -4,6 +4,9 @@
 
 Najważniejsze są trzy: rekord odczytany jest identyczny z zapisanym, ręczna zmiana
 w bazie jest wykrywana, a ten sam plik dwa razy nie tworzy duplikatu.
+
+Wykonanie jest tu jedno i stałe: badamy przebieg i odczyt. Invariant wykonań — ten sam albo
+inny odcisk — sprawdza ``tests/store/test_executions.py``.
 """
 
 import datetime as dt
@@ -17,7 +20,9 @@ from xray.mapping import MappingProfile
 from xray.model import FindingRecord, LogicalStatus, PeriodRef, ScopeRef
 from xray.store import (
     ConflictingRun,
+    ExecutionRef,
     FindingStore,
+    FingerprintStatus,
     ProjectionMismatch,
     RunRef,
     connect,
@@ -31,6 +36,13 @@ KOSZTY = (
 )
 ZAKRES = ScopeRef(scope_label="cała firma")
 OKRES = PeriodRef(period_start=dt.date(2026, 1, 1), period_end=dt.date(2026, 2, 28))
+
+WYKONANIE = ExecutionRef(
+    execution_fingerprint="FPR-testowy",
+    fingerprint_status=FingerprintStatus.KNOWN,
+    fingerprint_basis={"opis": "odcisk zadeklarowany w teście: ten sam kod i środowisko"},
+    code_provenance={"git_status": "unavailable", "reason": "test jednostkowy"},
+)
 
 
 def zapisz_plik(katalog: Path, tresc: str = KOSZTY, nazwa: str = "koszty.csv") -> Path:
@@ -64,7 +76,7 @@ def test_rekord_odczytany_jest_identyczny_z_zapisanym(tmp_path: Path) -> None:
     store = FindingStore(connect(":memory:"))
     run = zbuduj_przebieg(tmp_path)
     wynik = zbuduj_wynik()
-    assert store.save_run(run, (wynik,)) is True
+    assert store.save_run(run, (wynik,), WYKONANIE) is True
     assert store.load_run(run.run_id) == (wynik,)
 
 
@@ -74,7 +86,7 @@ def test_zapis_przetrwa_zamkniecie_bazy(tmp_path: Path) -> None:
     run = zbuduj_przebieg(tmp_path)
     wynik = zbuduj_wynik()
     polaczenie = connect(plik_bazy)
-    FindingStore(polaczenie).save_run(run, (wynik,))
+    FindingStore(polaczenie).save_run(run, (wynik,), WYKONANIE)
     polaczenie.close()
     assert FindingStore(connect(plik_bazy)).load_run(run.run_id) == (wynik,)
 
@@ -88,7 +100,7 @@ def test_reczna_zmiana_tresci_w_bazie_jest_odrzucana(tmp_path: Path) -> None:
     store = FindingStore(polaczenie)
     run = zbuduj_przebieg(tmp_path)
     wynik = zbuduj_wynik()
-    store.save_run(run, (wynik,))
+    store.save_run(run, (wynik,), WYKONANIE)
 
     podmieniony = wynik.model_copy(update={"test_id": "FIN-01"}).model_dump_json()
     polaczenie.execute(
@@ -111,7 +123,7 @@ def test_reczna_zmiana_kolumny_indeksu_jest_wykrywana(tmp_path: Path) -> None:
     store = FindingStore(polaczenie)
     run = zbuduj_przebieg(tmp_path)
     wynik = zbuduj_wynik()
-    store.save_run(run, (wynik,))
+    store.save_run(run, (wynik,), WYKONANIE)
 
     polaczenie.execute(
         "UPDATE findings SET status = 'CRITICAL' WHERE finding_id = ?",
@@ -140,19 +152,20 @@ def test_powtorny_zapis_nie_tworzy_duplikatu(tmp_path: Path) -> None:
     store = FindingStore(connect(":memory:"))
     run = zbuduj_przebieg(tmp_path)
     wynik = zbuduj_wynik()
-    assert store.save_run(run, (wynik,)) is True
-    assert store.save_run(run, (wynik,)) is False
+    assert store.save_run(run, (wynik,), WYKONANIE) is True
+    assert store.save_run(run, (wynik,), WYKONANIE) is False
     assert len(store.load_run(run.run_id)) == 1
     assert store.runs() == (run.run_id,)
 
 
 def test_ten_sam_przebieg_z_inna_trescia_jest_sprzecznoscia(tmp_path: Path) -> None:
-    """Ten sam skrót wejścia z innym wynikiem znaczy, że przepływ nie jest deterministyczny."""
+    """Ten sam skrót wejścia i ten sam odcisk z innym wynikiem: przepływ nie jest
+    deterministyczny."""
     store = FindingStore(connect(":memory:"))
     run = zbuduj_przebieg(tmp_path)
-    store.save_run(run, (zbuduj_wynik(metric_value=2.0),))
+    store.save_run(run, (zbuduj_wynik(metric_value=2.0),), WYKONANIE)
     with pytest.raises(ConflictingRun) as blad:
-        store.save_run(run, (zbuduj_wynik(metric_value=99.0),))
+        store.save_run(run, (zbuduj_wynik(metric_value=99.0),), WYKONANIE)
     assert "deterministyczny" in str(blad.value)
 
 
@@ -192,16 +205,19 @@ def test_zmiana_formatu_pliku_nie_tworzy_nowego_przebiegu(tmp_path: Path) -> Non
     )
 
 
-def test_czas_wykonania_nie_wchodzi_do_tozsamosci(tmp_path: Path) -> None:
-    """Gdyby wchodził, dwa przebiegi na tych samych danych dałyby różne identyfikatory."""
-    raport = load_table(zapisz_plik(tmp_path), "COST", dataset_id=ZBIOR).report
-    wczesniej = RunRef.create(
-        dataset_id=ZBIOR, reports=[raport], executed_at=dt.datetime(2026, 1, 1)
-    )
-    pozniej = RunRef.create(
-        dataset_id=ZBIOR, reports=[raport], executed_at=dt.datetime(2026, 9, 6)
-    )
-    assert wczesniej.run_id == pozniej.run_id
+def test_czas_wykonania_nie_wchodzi_do_zadnej_tozsamosci(tmp_path: Path) -> None:
+    """executed_at jest polem audytowym poza tożsamością przebiegu i wykonania.
+
+    Gdyby wchodził, każde wykonanie byłoby „nowe", a kontrola determinizmu cicho
+    przestałaby działać.
+    """
+    store = FindingStore(connect(":memory:"))
+    run = zbuduj_przebieg(tmp_path)
+    wczesniej = WYKONANIE.model_copy(update={"executed_at": dt.datetime(2026, 1, 1)})
+    pozniej = WYKONANIE.model_copy(update={"executed_at": dt.datetime(2026, 9, 6)})
+    assert store.save_run(run, (zbuduj_wynik(),), wczesniej) is True
+    assert store.save_run(run, (zbuduj_wynik(),), pozniej) is False
+    assert "executed_at" not in RunRef.model_fields
 
 
 def test_kolejnosc_raportow_nie_zmienia_tozsamosci(tmp_path: Path) -> None:
@@ -242,7 +258,7 @@ def test_podstawa_identyfikatora_jest_odczytywalna(tmp_path: Path) -> None:
 
 
 def test_historia_wyniku_przez_kolejne_przebiegi(tmp_path: Path) -> None:
-    """Główny zysk z klucza (finding_id, run_id).
+    """Główny zysk z tego, że wynik nie jest kluczowany samym finding_id.
 
     Po finding_id widać, jak zmieniała się ta sama odpowiedź na to samo pytanie.
     """
@@ -256,28 +272,32 @@ def test_historia_wyniku_przez_kolejne_przebiegi(tmp_path: Path) -> None:
     drugi = zbuduj_przebieg(b, KOSZTY.replace("200", "250"))
     assert pierwszy.run_id != drugi.run_id
 
-    store.save_run(pierwszy, (zbuduj_wynik(metric_value=2.0),))
-    store.save_run(drugi, (zbuduj_wynik(metric_value=2.0, finding="Po poprawce."),))
+    store.save_run(pierwszy, (zbuduj_wynik(metric_value=2.0),), WYKONANIE)
+    store.save_run(
+        drugi, (zbuduj_wynik(metric_value=2.0, finding="Po poprawce."),), WYKONANIE
+    )
 
     finding_id = zbuduj_wynik().finding_id
     historia = store.history(finding_id)
     assert len(historia) == 2
-    assert {run_id for run_id, _ in historia} == {pierwszy.run_id, drugi.run_id}
-    assert [rekord.finding for _, rekord in historia] == [
+    assert {run_id for run_id, _, _ in historia} == {pierwszy.run_id, drugi.run_id}
+    assert [rekord.finding for _, _, rekord in historia] == [
         "Brak sygnału niekorzystnego.",
         "Po poprawce.",
     ]
 
 
 def test_ten_sam_wynik_w_dwoch_przebiegach_nie_jest_duplikatem(tmp_path: Path) -> None:
-    """Klucz jest parą, więc ten sam finding_id może wystąpić w wielu przebiegach."""
+    """Ten sam finding_id może wystąpić w wielu przebiegach."""
     a = tmp_path / "a"
     b = tmp_path / "b"
     a.mkdir()
     b.mkdir()
     store = FindingStore(connect(":memory:"))
-    store.save_run(zbuduj_przebieg(a), (zbuduj_wynik(),))
-    store.save_run(zbuduj_przebieg(b, KOSZTY.replace("200", "250")), (zbuduj_wynik(),))
+    store.save_run(zbuduj_przebieg(a), (zbuduj_wynik(),), WYKONANIE)
+    store.save_run(
+        zbuduj_przebieg(b, KOSZTY.replace("200", "250")), (zbuduj_wynik(),), WYKONANIE
+    )
     assert len(store.history(zbuduj_wynik().finding_id)) == 2
 
 
@@ -306,14 +326,15 @@ def test_inna_liczba_odrzucen_daje_inny_przebieg(tmp_path: Path) -> None:
 def test_wersja_przebiegu_i_wyniku_sa_niezalezne() -> None:
     """Reguła z DT-14 bez testu byłaby regułą, którą ktoś złamie przy pierwszym pośpiechu.
 
-    Krotka RunRef zyskała profile_digest, więc wersja przebiegu poszła na "2". Krotka
-    FindingRecord się nie zmieniła, więc jej wersja ZOSTAJE "1" — jedna wspólna stała
-    unieważniałaby weryfikację rekordów, których zmiana w ogóle nie dotyczyła.
+    Krotka RunRef zmieniała się dwa razy (profile_digest, potem zestawienie odrzuceń),
+    więc wersja przebiegu jest dziś "3". Krotka FindingRecord się nie zmieniła, więc jej
+    wersja ZOSTAJE "1" — jedna wspólna stała unieważniałaby weryfikację rekordów, których
+    zmiana w ogóle nie dotyczyła.
     """
     from xray.model.findings.identity import IDENTITY_ALGORITHM_VERSION
     from xray.store.runs import RUN_IDENTITY_VERSION
 
-    assert RUN_IDENTITY_VERSION == "2"
+    assert RUN_IDENTITY_VERSION == "3"
     assert IDENTITY_ALGORITHM_VERSION == "1"
     assert RUN_IDENTITY_VERSION != IDENTITY_ALGORITHM_VERSION
 
@@ -324,8 +345,8 @@ def test_wersja_przebiegu_i_wyniku_sa_niezalezne() -> None:
 def test_przebieg_deklaruje_wersje_ktora_go_policzyla(tmp_path: Path) -> None:
     """Dodanie pola i podniesienie wersji weszły jedną zmianą.
 
-    W dwóch podejściach powstałyby rekordy deklarujące "1", a policzone krotką "2" —
-    i nic nie odróżniłoby ich później od uszkodzonych.
+    W dwóch podejściach powstałyby rekordy deklarujące starą wersję, a policzone nową
+    krotką — i nic nie odróżniłoby ich później od uszkodzonych.
     """
     from xray.store.runs import RUN_IDENTITY_VERSION
 
