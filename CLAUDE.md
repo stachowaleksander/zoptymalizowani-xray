@@ -61,14 +61,21 @@ Nigdy nie udawaj, że moduł robi więcej, niż robi. Każdy moduł deklaruje sw
 
 ```
 src/xray/
+  canonical/   profile kanoniczne, tożsamości, koperta ładunku i kontekst wyłączeń:
+               JSON, okres, scope_id, reference_id, oś komponentu,
+               XR_RESULT_IDENTITY_V2, ResultPayloadEnvelopeV1,
+               EffectiveExclusionContextV1 (BIND-01 v1.1 §7–§12, karta V12-R1 §6–§10)
   ingest/      odczyt XLSX/CSV (docelowo też konektory) → surowe ramki
   mapping/     profil kolumn klienta (YAML) + propozycja + raport mapowania
   model/       kontrakty: ACTIVITY, COST, RESOURCE, PROCESS, PLAN + FINDINGS
   validation/  rejestr kontroli → PASS / WARNING / CRITICAL
-  engine/      rejestr testów diagnostycznych; każdy test to wtyczka
+  engine/      rejestr testów diagnostycznych (wtyczki), zamrożony rejestr komponentów
+               Core 10 i statusy jednostek wykonania (karta V12-R1 §6.1, BIND-01
+               v1.2 §7 i §7.1)
   crosscut/    MGT-01, PRI-01, CONF-01 nad gotowymi wynikami
   orch/        ORCH-01: sprawa → gałąź → krok, maszyna stanów
-  store/       trwały zapis: findings, dowody, klastry, sprawy, ślad
+  store/       trwały zapis: findings, przebiegi, wykonania, próby wykonania,
+               rekordy wyniku i porównania par, dowody, klastry, sprawy, ślad
   report/      komunikat zarządczy i eksport
   synth/       generator firmy syntetycznej
 tests/         pytest

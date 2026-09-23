@@ -41,7 +41,7 @@ from xray.engine.base import TestReadiness
 from xray.ingest import LoadResult, load_table
 from xray.mapping import MappingProfile, MappingReport, apply_profile
 from xray.model import FindingRecord, PeriodRef, ScopeRef, get_table, table_names
-from xray.store import ExecutionRef, FindingStore, RunRef, connect
+from xray.store import ExecutionRef, FindingStore, RunRef, SaveOutcome, connect
 from xray.synth import GeneratedDataset, generate
 from xray.validation import CheckResult, ValidationContext, run_checks
 
@@ -76,7 +76,7 @@ class DemoResult:
     run: RunRef
     execution: ExecutionRef
     stored: tuple[FindingRecord, ...]
-    written: bool
+    written: SaveOutcome
     store: FindingStore = field(repr=False)
 
     def table(self, name: str) -> TableRun:
@@ -164,7 +164,7 @@ def run_demo(
     )
     wykonanie = ExecutionRef.capture(executed_at=dt.datetime.now())
     magazyn = FindingStore(connect(baza))
-    zapisano = magazyn.save_run(przebieg, wyniki, wykonanie)
+    zapis = magazyn.save_run(przebieg, wyniki, wykonanie)
 
     # 6. Odczyt: rekord sam potwierdza swoją tożsamość.
     return DemoResult(
@@ -176,7 +176,7 @@ def run_demo(
         run=przebieg,
         execution=wykonanie,
         stored=magazyn.load_run(przebieg.run_id),
-        written=zapisano,
+        written=zapis,
         store=magazyn,
     )
 
@@ -306,7 +306,10 @@ def opisz(wynik: DemoResult) -> str:
         f"   odcisk wykonania: {wykonanie.execution_fingerprint or '— (nieznany)'}",
         f"   status odcisku  : {wykonanie.fingerprint_status.value}",
         f"   git (opis)      : {opis_gita}",
-        f"   zapisano        : {'tak' if wynik.written else 'nie (już był)'}",
+        f"   próba wykonania : {wynik.written.execution_attempt_id}",
+        f"   opis wykonania  : "
+        f"{'nowy' if wynik.written.execution_described_now else 'już zapisany'}"
+        f", wyników: {wynik.written.findings_written}",
         f"   odczytano       : {len(wynik.stored)} rekordów",
         f"   identyczne      : {'tak' if wynik.stored == wynik.findings else 'NIE'}",
         "",

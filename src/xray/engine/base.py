@@ -35,6 +35,8 @@ from typing import Any, ClassVar
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
+from xray.engine.component_registry import check_component
+from xray.engine.units import UnitDeclaration
 from xray.ingest.report import ImportReport
 from xray.model import TABLES, FindingRecord, LogicalStatus, PeriodRef, ScopeRef
 
@@ -117,6 +119,18 @@ class DiagnosticTestDeclaration(BaseModel):
     jest jeszcze zaimplementowany.
     """
 
+    units: tuple[UnitDeclaration, ...] = ()
+    """Jednostki wykonania testu — para ``(test_id, calculation_component_ref)`` każda.
+
+    Puste domyślnie, więc deklaracje sprzed pakietu P10 działają bez zmian. Test, który
+    jednostki zadeklaruje, dostaje dwie rzeczy: status **per jednostka** (BIND-01 v1.2 §7)
+    i blokowanie **selektywne** — CRITICAL zdejmuje wyłącznie te jednostki, które zależą od
+    dotkniętej tabeli albo pola, a nie cały test.
+
+    Każdy komponent jest sprawdzany wobec zamrożonego rejestru z karty §6.1: jednostki
+    z wymyślonym ``component_id`` nie da się zadeklarować.
+    """
+
     @model_validator(mode="after")
     def _check_against_contract(self) -> "DiagnosticTestDeclaration":
         """Sprawdza deklarację wobec kontraktu danych i kontraktu FINDINGS.
@@ -147,6 +161,31 @@ class DiagnosticTestDeclaration(BaseModel):
                     f"test {self.test_id}: tabela {tabela} nie ma pól "
                     f"{', '.join(brakujace)}"
                 )
+
+        for jednostka in self.units:
+            if jednostka.test_id != self.test_id:
+                raise ValueError(
+                    f"jednostka {jednostka.unit_id} deklaruje inny test niż {self.test_id}"
+                )
+            check_component(self.test_id, jednostka.component_ref)
+            nieznane_tabele = [t for t in jednostka.required_tables if t not in TABLES]
+            if nieznane_tabele:
+                raise ValueError(
+                    f"jednostka {jednostka.unit_id} wymaga nieznanych tabel: "
+                    f"{', '.join(nieznane_tabele)}"
+                )
+            for tabela, pola in jednostka.required_fields.items():
+                if tabela not in jednostka.required_tables:
+                    raise ValueError(
+                        f"jednostka {jednostka.unit_id} wymaga pól z tabeli {tabela}, "
+                        "której nie ma w jej required_tables"
+                    )
+                brakujace = [p for p in pola if p not in set(TABLES[tabela].model_fields)]
+                if brakujace:
+                    raise ValueError(
+                        f"jednostka {jednostka.unit_id}: tabela {tabela} nie ma pól "
+                        f"{', '.join(brakujace)}"
+                    )
 
         nieznane_pola = [
             p for p in self.produced_fields if p not in FindingRecord.model_fields

@@ -135,8 +135,9 @@ class RunRef(BaseModel):
     Bez tego pola ``plan_metrics`` byłyby niewidoczne dla tożsamości: nie zmieniają treści
     żadnego rekordu, więc nie zmieniają ``content_digest`` — a zmieniają wynik, bo dopiero
     z nimi PLAN może służyć jako ``reference_type = plan_budget``. Skutkiem byłby ten sam
-    ``run_id`` przy innej treści, czyli ``ConflictingRun`` z komunikatem „przepływ nie jest
-    deterministyczny", choć jest.
+    ``run_id`` przy innej treści — a więc para wykonań wyglądająca na niedeterminizm, choć
+    przepływ jest deterministyczny. Po rundzie V12-R1 magazyn takiej pary nie odrzuca, tylko
+    ją zachowuje i oddaje do klasyfikacji, więc fałszywa diagnoza byłaby **zapisana**.
     """
 
     contract_version: str = CONTRACT_VERSION

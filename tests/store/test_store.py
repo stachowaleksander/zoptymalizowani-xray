@@ -19,7 +19,6 @@ from xray.ingest import load_table
 from xray.mapping import MappingProfile
 from xray.model import FindingRecord, LogicalStatus, PeriodRef, ScopeRef
 from xray.store import (
-    ConflictingRun,
     ExecutionRef,
     FindingStore,
     FingerprintStatus,
@@ -76,7 +75,7 @@ def test_rekord_odczytany_jest_identyczny_z_zapisanym(tmp_path: Path) -> None:
     store = FindingStore(connect(":memory:"))
     run = zbuduj_przebieg(tmp_path)
     wynik = zbuduj_wynik()
-    assert store.save_run(run, (wynik,), WYKONANIE) is True
+    store.save_run(run, (wynik,), WYKONANIE)
     assert store.load_run(run.run_id) == (wynik,)
 
 
@@ -147,26 +146,43 @@ def test_ten_sam_plik_dwa_razy_daje_ten_sam_przebieg(tmp_path: Path) -> None:
     assert zbuduj_przebieg(a).run_id == zbuduj_przebieg(b).run_id
 
 
-def test_powtorny_zapis_nie_tworzy_duplikatu(tmp_path: Path) -> None:
-    """Bez tego testu idempotentność byłaby deklaracją."""
+def test_powtorny_zapis_nie_duplikuje_wyniku_ale_zapisuje_probe(tmp_path: Path) -> None:
+    """**Zastąpiona własność:** powtórny zapis zwracał ``False`` i nie zostawiał niczego.
+
+    **Co ją zastąpiło:** wynik nadal nie jest duplikowany — ``execution_id`` powstaje
+    z treści, więc drugi zapis opisuje to samo wykonanie. Nowa jest próba: fakt ponownego
+    uruchomienia obliczenia ma swój wiersz (karta §9).
+    """
     store = FindingStore(connect(":memory:"))
     run = zbuduj_przebieg(tmp_path)
     wynik = zbuduj_wynik()
-    assert store.save_run(run, (wynik,), WYKONANIE) is True
-    assert store.save_run(run, (wynik,), WYKONANIE) is False
+    pierwszy = store.save_run(run, (wynik,), WYKONANIE)
+    drugi = store.save_run(run, (wynik,), WYKONANIE)
+
+    assert pierwszy.execution_described_now is True
+    assert drugi.execution_described_now is False
     assert len(store.load_run(run.run_id)) == 1
     assert store.runs() == (run.run_id,)
+    assert len(store.attempts(run.run_id)) == 2
 
 
-def test_ten_sam_przebieg_z_inna_trescia_jest_sprzecznoscia(tmp_path: Path) -> None:
-    """Ten sam skrót wejścia i ten sam odcisk z innym wynikiem: przepływ nie jest
-    deterministyczny."""
+def test_ten_sam_przebieg_z_inna_trescia_daje_dwa_wykonania(tmp_path: Path) -> None:
+    """**Zastąpiona własność:** ten sam skrót wejścia i ten sam odcisk z innym wynikiem
+    kończyły się ``ConflictingRun`` — magazyn odmawiał zapisu i drugi wynik przepadał.
+
+    **Co ją zastąpiło:** oba wykonania są zapisane. Ocena „czy to niedeterminizm" nie jest
+    już efektem ubocznym ograniczenia w bazie, tylko osobnym krokiem klasyfikacji nad
+    zachowanym dowodem.
+    """
     store = FindingStore(connect(":memory:"))
     run = zbuduj_przebieg(tmp_path)
     store.save_run(run, (zbuduj_wynik(metric_value=2.0),), WYKONANIE)
-    with pytest.raises(ConflictingRun) as blad:
-        store.save_run(run, (zbuduj_wynik(metric_value=99.0),), WYKONANIE)
-    assert "deterministyczny" in str(blad.value)
+    store.save_run(run, (zbuduj_wynik(metric_value=99.0),), WYKONANIE)
+
+    assert len(store.executions(run.run_id)) == 2
+    assert len(store.attempts(run.run_id)) == 2
+    with pytest.raises(ValueError, match="wykonań"):
+        store.load_run(run.run_id)
 
 
 # --- tożsamość przebiegu ---------------------------------------------------------------
@@ -215,8 +231,11 @@ def test_czas_wykonania_nie_wchodzi_do_zadnej_tozsamosci(tmp_path: Path) -> None
     run = zbuduj_przebieg(tmp_path)
     wczesniej = WYKONANIE.model_copy(update={"executed_at": dt.datetime(2026, 1, 1)})
     pozniej = WYKONANIE.model_copy(update={"executed_at": dt.datetime(2026, 9, 6)})
-    assert store.save_run(run, (zbuduj_wynik(),), wczesniej) is True
-    assert store.save_run(run, (zbuduj_wynik(),), pozniej) is False
+    pierwszy = store.save_run(run, (zbuduj_wynik(),), wczesniej)
+    drugi = store.save_run(run, (zbuduj_wynik(),), pozniej)
+    # ten sam opis wykonania mimo innego czasu — czas nie wchodzi do żadnej tożsamości
+    assert pierwszy.execution_id == drugi.execution_id
+    assert drugi.execution_described_now is False
     assert "executed_at" not in RunRef.model_fields
 
 

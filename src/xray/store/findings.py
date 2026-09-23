@@ -8,14 +8,15 @@ To jedyne miejsce zapisu wyników. Nikt nie liczy niczego obok.
 
 | run_id | odcisk wykonania | treść wyników | zachowanie |
 | --- | --- | --- | --- |
-| ten sam | ten sam | ta sama | brak operacji |
-| ten sam | ten sam | inna | ``ConflictingRun`` — **błąd**, nie nadpisanie |
-| ten sam | inny | dowolna | nowe wykonanie; poprzednie zostaje |
+| ten sam | ten sam | ta sama | **nowa próba**; opis wykonania i wyniki już są |
+| ten sam | ten sam | inna | **nowa próba i nowy opis**; relację klasyfikuje porównanie |
+| ten sam | inny | dowolna | nowa próba i nowe wykonanie; poprzednie zostaje |
 | inny | dowolny | dowolna | nowy przebieg |
 
-Rozstrzyga ograniczenie schematu (``xray.store.schema``), a nie porównanie w tym pliku.
-``FindingStore`` tłumaczy jedynie naruszenie tego ograniczenia na wyjątek o znaczeniu
-domenowym.
+Drugi wiersz to zmiana z rundy V12-R1. Wcześniej ta sytuacja kończyła się wyjątkiem
+``ConflictingRun`` i **utratą drugiego wyniku**; teraz zostają oba, a to, czy jest to
+niedeterminizm, rozstrzyga ``classify`` z ``store/comparisons.py`` — po zapisaniu dowodu,
+nie zamiast niego (karta §9 i §11).
 
 Przebieg, wykonanie i jego wyniki zapisujemy w jednej transakcji. Wynik zapisany częściowo
 byłby śladem, który kłamie o tym, co policzono.
@@ -29,6 +30,7 @@ from dataclasses import dataclass
 
 from xray.model import FindingRecord
 from xray.model.findings.identity import canonical_form
+from xray.store.attempts import DEFAULT_TERMINAL_STATUS, ExecutionAttemptRecord
 from xray.store.executions import ExecutionRef, FingerprintStatus, result_digest
 from xray.store.runs import RunRef
 from xray.store.schema import finding_columns
@@ -43,15 +45,6 @@ class ProjectionMismatch(RuntimeError):
     """
 
 
-class ConflictingRun(RuntimeError):
-    """Ten sam przebieg wykonany tym samym odciskiem dał inny wynik.
-
-    Ten sam skrót wejścia, ten sam kod i to samo środowisko, inna treść — przepływ nie jest
-    deterministyczny. Inny odcisk przy innej treści sprzecznością **nie jest**: to dwa
-    legalne wykonania tego samego przebiegu.
-    """
-
-
 @dataclass(frozen=True, slots=True)
 class StoredExecution:
     """Zapisane wykonanie przebiegu."""
@@ -60,6 +53,28 @@ class StoredExecution:
     run_id: str
     result_digest: str
     execution: ExecutionRef
+
+
+@dataclass(frozen=True, slots=True)
+class SaveOutcome:
+    """Co dokładnie zrobił zapis — zamiast dawnego ``bool``.
+
+    Dawne ``False`` znaczyło „pominięto", i to było jedyne, czego wołający się dowiadywał.
+    Teraz każdy zapis **coś** zostawia (zawsze próbę) i mówi wprost, co jeszcze doszło.
+    """
+
+    execution_attempt_id: str
+    """Zawsze nowy: każda faktycznie wykonana próba ma własny ślad (karta §9)."""
+
+    execution_id: str
+    execution_described_now: bool
+    """Czy opis wykonania powstał teraz, czy był już zapisany z poprzedniej próby.
+
+    ``False`` **nie znaczy** „pominięto zapis": ``execution_id`` powstaje z treści, więc ten
+    sam identyfikator to dosłownie ten sam opis. Zdarzenie zapisała próba.
+    """
+
+    findings_written: int
 
 
 class FindingStore:
@@ -75,49 +90,54 @@ class FindingStore:
         run: RunRef,
         findings: Sequence[FindingRecord],
         execution: ExecutionRef,
-    ) -> bool:
-        """Zapisuje wykonanie przebiegu wraz z wynikami. Zwraca, czy coś zapisano.
+        *,
+        attempt: ExecutionAttemptRecord | None = None,
+    ) -> SaveOutcome:
+        """Zapisuje **faktycznie wykonaną próbę** wraz z wykonaniem i wynikami.
 
-        ``False`` — to samo wykonanie z tą samą treścią już jest. ``ConflictingRun`` — ten
-        sam przebieg i odcisk z inną treścią.
+        Do rundy V12-R1 ta metoda potrafiła nie zapisać: ``ON CONFLICT DO NOTHING`` i zwrotka
+        ``False`` oznaczały „to już jest, pomijam", a ``UNIQUE (run_id, execution_fingerprint)``
+        zamieniał drugi, inny wynik tego samego odcisku w wyjątek. Karta §9 zabrania obu
+        rzeczy: ``EVERY_ACTUAL_EXECUTION_ATTEMPT_PERSISTED`` i
+        ``IDENTICAL_ATTEMPT_MAY_NOT_BE_DROPPED_BY_STORAGE_DEDUPLICATION``.
+
+        Teraz każde wywołanie dokłada wiersz do ``execution_attempts`` — zawsze, także gdy
+        opis wykonania i wyniki są co do bajtu te same. Sprzeczność nie jest już odmową
+        zapisu, tylko materiałem do klasyfikacji: dwie próby, dwa opisy, a relację między
+        nimi rozstrzyga ``classify`` z ``store/comparisons.py``.
+
+        Wołający, który **nie** uruchomił obliczenia (trafienie w cache przed wykonaniem),
+        nie ma prawa tu wejść — patrz ``attempt_required`` w ``store/attempts.py``.
         """
         skrot_wyniku = result_digest(findings)
         execution_id = execution.execution_id(run.run_id, skrot_wyniku)
-        try:
-            with self._db:  # transakcja: wszystko albo nic
-                self._db.execute(
-                    "INSERT INTO runs (run_id, dataset_id, contract_version, "
-                    "identity_algorithm_version, input_digest) VALUES (?, ?, ?, ?, ?) "
-                    "ON CONFLICT(run_id) DO NOTHING",
-                    (
-                        run.run_id,
-                        run.dataset_id,
-                        run.contract_version,
-                        run.identity_algorithm_version,
-                        run.input_digest,
-                    ),
-                )
-                kursor = self._db.execute(
-                    "INSERT INTO executions (execution_id, run_id, execution_fingerprint, "
-                    "fingerprint_status, result_digest, fingerprint_basis, code_provenance, "
-                    "input_provenance, executed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                    "ON CONFLICT(execution_id) DO NOTHING",
-                    (
-                        execution_id,
-                        run.run_id,
-                        execution.execution_fingerprint,
-                        execution.fingerprint_status.value,
-                        skrot_wyniku,
-                        canonical_form(execution.fingerprint_basis),
-                        canonical_form(execution.code_provenance),
-                        run.provenance,
-                        execution.executed_at.isoformat() if execution.executed_at else None,
-                    ),
-                )
-                if kursor.rowcount == 0:
-                    # To wykonanie — ten sam przebieg, odcisk i treść — już jest zapisane.
-                    # Wyników nie wstawiamy drugi raz: należą do istniejącego wykonania.
-                    return False
+        proba = attempt or ExecutionAttemptRecord.create(
+            semantic_run_id=run.run_id,
+            execution_fingerprint=execution.execution_fingerprint,
+            fingerprint_status=execution.fingerprint_status,
+            execution_provenance_ref=execution_id,
+            attempt_completed_at=execution.executed_at,
+            terminal_status=DEFAULT_TERMINAL_STATUS,
+        )
+
+        with self._db:  # transakcja: wszystko albo nic
+            self._db.execute(
+                "INSERT INTO runs (run_id, dataset_id, contract_version, "
+                "identity_algorithm_version, input_digest) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(run_id) DO NOTHING",
+                (
+                    run.run_id,
+                    run.dataset_id,
+                    run.contract_version,
+                    run.identity_algorithm_version,
+                    run.input_digest,
+                ),
+            )
+            opisane_teraz = self._describe_execution(
+                run, execution, execution_id, skrot_wyniku
+            )
+            zapisane_wyniki = 0
+            if opisane_teraz:
                 for record in findings:
                     kolumny = finding_columns(record, run.run_id, execution_id)
                     self._db.execute(
@@ -126,20 +146,88 @@ class FindingStore:
                         ),
                         tuple(kolumny.values()),
                     )
-        except sqlite3.IntegrityError as blad:
-            # Jedynym ograniczeniem UNIQUE poza kluczami głównymi jest
-            # UNIQUE (run_id, execution_fingerprint). Pozostałe naruszenia (np. dwa wyniki
-            # o tym samym finding_id w jednym wykonaniu) nie są sprzecznością przebiegu
-            # i nie wolno ich tak nazwać.
-            if blad.sqlite_errorname != "SQLITE_CONSTRAINT_UNIQUE":
-                raise
-            raise ConflictingRun(
-                f"przebieg {run.run_id} ma już zapisane wykonanie z odciskiem "
-                f"{execution.execution_fingerprint} i inną treścią wyników. Ten sam przebieg, "
-                "ten sam kod i to samo środowisko dały inny wynik, więc przepływ nie jest "
-                "deterministyczny — to błąd do naprawienia, nie stan do nadpisania"
-            ) from blad
+                    zapisane_wyniki += 1
+            # ASSUMPTION: B-16 — próba zapisuje się w tej samej transakcji co wyniki,
+            # więc błąd ich zapisu cofa także ślad faktycznie wykonanej próby. Karta §9
+            # (EVERY_ACTUAL_EXECUTION_ATTEMPT_PERSISTED) mówi co innego niż zasada
+            # atomowości z nagłówka tego modułu; rozbieżność jest zadeklarowana, nie
+            # rozstrzygnięta.
+            self._save_attempt(proba, execution_id)
+
+        return SaveOutcome(
+            execution_attempt_id=proba.execution_attempt_id,
+            execution_id=execution_id,
+            execution_described_now=opisane_teraz,
+            findings_written=zapisane_wyniki,
+        )
+
+    def _describe_execution(
+        self,
+        run: RunRef,
+        execution: ExecutionRef,
+        execution_id: str,
+        skrot_wyniku: str,
+    ) -> bool:
+        """Dokłada opis wykonania, jeżeli tego opisu jeszcze nie ma.
+
+        To nie jest deduplikacja zdarzeń: ``execution_id`` powstaje z ``run_id``, odcisku
+        i skrótu treści, więc istniejący wiersz o tym identyfikatorze niesie **dokładnie
+        tę samą** treść. Zdarzenie — czyli fakt, że obliczenie ruszyło jeszcze raz —
+        zapisuje próba, i ona powstaje zawsze.
+        """
+        istnieje = self._db.execute(
+            "SELECT 1 FROM executions WHERE execution_id = ?", (execution_id,)
+        ).fetchone()
+        if istnieje is not None:
+            return False
+        self._db.execute(
+            "INSERT INTO executions (execution_id, run_id, execution_fingerprint, "
+            "fingerprint_status, result_digest, fingerprint_basis, code_provenance, "
+            "input_provenance, executed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                execution_id,
+                run.run_id,
+                execution.execution_fingerprint,
+                execution.fingerprint_status.value,
+                skrot_wyniku,
+                canonical_form(execution.fingerprint_basis),
+                canonical_form(execution.code_provenance),
+                run.provenance,
+                execution.executed_at.isoformat() if execution.executed_at else None,
+            ),
+        )
         return True
+
+    def _save_attempt(self, attempt: ExecutionAttemptRecord, execution_id: str) -> None:
+        """Zapisuje próbę. Bez ``ON CONFLICT``: identyfikator jest losowy, więc kolizja
+        oznaczałaby błąd generatora, a nie powtórzenie — i ma wybuchnąć."""
+        self._db.execute(
+            "INSERT INTO execution_attempts (execution_attempt_id, semantic_run_id, "
+            "semantic_run_profile, semantic_run_identity_version, execution_id, "
+            "execution_fingerprint, fingerprint_status, execution_provenance_ref, "
+            "attempt_started_at, attempt_completed_at, terminal_status, "
+            "foundation_bind_version, payload) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                attempt.execution_attempt_id,
+                attempt.semantic_run_id,
+                attempt.semantic_run_profile,
+                attempt.semantic_run_identity_version,
+                execution_id,
+                attempt.execution_fingerprint,
+                attempt.fingerprint_status.value,
+                attempt.execution_provenance_ref,
+                attempt.attempt_started_at.isoformat() if attempt.attempt_started_at else None,
+                (
+                    attempt.attempt_completed_at.isoformat()
+                    if attempt.attempt_completed_at
+                    else None
+                ),
+                attempt.terminal_status,
+                attempt.foundation_bind_version,
+                attempt.model_dump_json(),
+            ),
+        )
 
     # --- odczyt ----------------------------------------------------------------------
 
@@ -189,6 +277,18 @@ class FindingStore:
             )
             for w in wiersze
         )
+
+    def attempts(self, run_id: str) -> tuple[ExecutionAttemptRecord, ...]:
+        """Wszystkie faktycznie wykonane próby tego przebiegu, w kolejności zapisu.
+
+        Dwie identyczne próby to dwa wpisy — na tym polega różnica wobec stanu sprzed
+        rundy V12-R1.
+        """
+        wiersze = self._db.execute(
+            "SELECT payload FROM execution_attempts WHERE semantic_run_id = ? ORDER BY rowid",
+            (run_id,),
+        ).fetchall()
+        return tuple(ExecutionAttemptRecord.model_validate_json(w["payload"]) for w in wiersze)
 
     def load_execution(self, execution_id: str) -> tuple[FindingRecord, ...]:
         """Wyniki jednego wykonania, w kolejności zapisu."""

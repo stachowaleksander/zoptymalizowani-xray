@@ -26,7 +26,9 @@ def test_przeplyw_spina_sie_na_pieciu_tabelach(tmp_path: Path) -> None:
     wynik = run_demo(tmp_path, **MALA)
     assert {t.table_name for t in wynik.tables} == set(table_names())
     assert all(t.load.report.records_rejected == 0 for t in wynik.tables)
-    assert wynik.written is True
+    assert wynik.written.execution_described_now is True
+    assert wynik.written.findings_written == len(wynik.findings)
+    assert wynik.written.execution_attempt_id.startswith("ATTEMPT-")
     assert wynik.stored == wynik.findings
 
 

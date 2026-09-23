@@ -133,8 +133,9 @@ rekordu, więc nie zmienia skrótu treści, więc nie zmienia ``run_id`` — a z
 bo dopiero z nią PLAN może służyć jako ``reference_type = plan_budget``.
 
 Skutek błędnego zapisu byłby taki: ten sam ``finding_id``, ten sam ``run_id``, inna treść
-→ ``ConflictingRun`` z komunikatem „przepływ nie jest deterministyczny". A przepływ jest
-deterministyczny. Magazyn postawiłby fałszywą diagnozę.
+→ para wykonań, którą warstwa porównania sklasyfikuje jako ``NONDETERMINISM_CONFLICT``.
+A przepływ jest deterministyczny. Diagnoza byłaby fałszywa — i po rundzie V12-R1 **trafiłaby
+do magazynu**, bo sprzeczności już nie odrzucamy, tylko zapisujemy i oceniamy.
 
 Do tożsamości przebiegu wchodzi więc **znacząca treść profilu**: faktycznie użyte
 przypisania kolumn, ``plan_metrics``, ``organization_timezone``. Nie wchodzą: bajty pliku,

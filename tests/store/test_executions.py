@@ -18,11 +18,11 @@ import pytest
 from xray.ingest import load_table
 from xray.model import FindingRecord, LogicalStatus, PeriodRef, ScopeRef
 from xray.store import (
-    ConflictingRun,
     ExecutionRef,
     FindingStore,
     FingerprintStatus,
     RunRef,
+    SaveOutcome,
     connect,
 )
 from xray.store.executions import (
@@ -78,56 +78,151 @@ def magazyn() -> FindingStore:
 # --- invariant: ten sam run_id -----------------------------------------------------------
 
 
-def test_ten_sam_odcisk_i_ta_sama_tresc_to_brak_operacji(
+def test_ten_sam_odcisk_i_ta_sama_tresc_to_druga_proba(
     magazyn: FindingStore, przebieg: RunRef
 ) -> None:
-    assert magazyn.save_run(przebieg, (wynik(),), wykonanie("FPR-a")) is True
-    assert magazyn.save_run(przebieg, (wynik(),), wykonanie("FPR-a")) is False
+    """**Zastąpiona własność:** do rundy V12-R1 drugi zapis zwracał ``False`` i nie
+    zostawiał śladu — „to już jest, pomijam".
+
+    **Co ją zastąpiło:** każdy zapis dokłada próbę. Opis wykonania i wyniki zostają te same
+    (``execution_id`` powstaje z treści), ale fakt, że obliczenie ruszyło drugi raz, jest
+    teraz zapisany. Karta §9:
+    ``IDENTICAL_ATTEMPT_MAY_NOT_BE_DROPPED_BY_STORAGE_DEDUPLICATION = true``.
+    """
+    pierwszy = magazyn.save_run(przebieg, (wynik(),), wykonanie("FPR-a"))
+    drugi = magazyn.save_run(przebieg, (wynik(),), wykonanie("FPR-a"))
+
+    assert pierwszy.execution_described_now is True
+    assert pierwszy.findings_written == 1
+    assert drugi.execution_described_now is False
+    assert drugi.findings_written == 0
+    assert pierwszy.execution_attempt_id != drugi.execution_attempt_id
+    assert pierwszy.execution_id == drugi.execution_id
+
+    assert len(magazyn.attempts(przebieg.run_id)) == 2
     assert len(magazyn.executions(przebieg.run_id)) == 1
     assert len(magazyn.history(wynik().finding_id)) == 1
 
 
-def test_ten_sam_odcisk_i_inna_tresc_to_sprzecznosc(
+def test_ten_sam_odcisk_i_inna_tresc_zachowuje_oba_dowody(
     magazyn: FindingStore, przebieg: RunRef
 ) -> None:
-    """Ten sam przebieg, kod i środowisko, inny wynik: przepływ nie jest deterministyczny."""
-    magazyn.save_run(przebieg, (wynik(1.0),), wykonanie("FPR-a"))
-    with pytest.raises(ConflictingRun) as blad:
-        magazyn.save_run(przebieg, (wynik(2.0),), wykonanie("FPR-a"))
-    assert "FPR-a" in str(blad.value)
-    # Transakcja: sprzeczne wykonanie nie zostawia śladu częściowego.
-    assert len(magazyn.executions(przebieg.run_id)) == 1
-    assert [r.metric_value for _, _, r in magazyn.history(wynik().finding_id)] == [1.0]
+    """**Zastąpiona własność:** ten sam przebieg i odcisk z inną treścią podnosił
+    ``ConflictingRun``, a drugi wynik **przepadał**. Schemat zabraniał sprzeczności.
+
+    **Co ją zastąpiło:** oba wykonania i oba wyniki są zapisane, a ocena, czy to
+    niedeterminizm, należy do ``classify`` z ``store/comparisons.py`` — po zachowaniu
+    dowodu, nie zamiast niego (karta §9 i §11.1: „Zero overwrite").
+    """
+    pierwszy = magazyn.save_run(przebieg, (wynik(1.0),), wykonanie("FPR-a"))
+    drugi = magazyn.save_run(przebieg, (wynik(2.0),), wykonanie("FPR-a"))
+
+    assert pierwszy.execution_id != drugi.execution_id
+    assert len(magazyn.executions(przebieg.run_id)) == 2
+    assert len(magazyn.attempts(przebieg.run_id)) == 2
+    assert sorted(r.metric_value for _, _, r in magazyn.history(wynik().finding_id)) == [
+        1.0,
+        2.0,
+    ]
 
 
-def test_sprzecznosc_rozstrzyga_schemat_a_nie_warunek_w_kodzie(przebieg: RunRef) -> None:
-    """Ograniczenie działa także z pominięciem FindingStore: invariant jest w strukturze."""
+def test_schemat_nie_zabrania_juz_dwoch_wynikow_tego_samego_odcisku(
+    przebieg: RunRef,
+) -> None:
+    """**Zastąpiona własność:** ``UNIQUE (run_id, execution_fingerprint)`` sprawiał, że
+    obejście ``FindingStore`` też kończyło się ``SQLITE_CONSTRAINT_UNIQUE``.
+
+    **Co ją zastąpiło:** schemat przestał zabraniać sprzeczności, bo zabranianie znaczyło
+    utratę drugiego dowodu. Zostaje to, czego schemat pilnuje nadal: klucz główny
+    wykonania, klucze obce i ``CHECK`` na zgodność statusu odcisku z jego obecnością.
+    """
     polaczenie = connect(":memory:")
     FindingStore(polaczenie).save_run(przebieg, (wynik(1.0),), wykonanie("FPR-a"))
+    polaczenie.execute(
+        "INSERT INTO executions (execution_id, run_id, execution_fingerprint, "
+        "fingerprint_status, result_digest, fingerprint_basis, code_provenance, "
+        "input_provenance) VALUES ('EXE-drugi-wynik', ?, 'FPR-a', 'known', 'RSET-inny', "
+        "'{}', '{}', '{}')",
+        (przebieg.run_id,),
+    )
+    assert polaczenie.execute("SELECT COUNT(*) FROM executions").fetchone()[0] == 2
+
+    # CHECK dalej pilnuje spójności statusu odcisku
     with pytest.raises(sqlite3.IntegrityError) as blad:
         polaczenie.execute(
             "INSERT INTO executions (execution_id, run_id, execution_fingerprint, "
             "fingerprint_status, result_digest, fingerprint_basis, code_provenance, "
-            "input_provenance) VALUES ('EXE-obejscie', ?, 'FPR-a', 'known', 'RSET-inny', "
+            "input_provenance) VALUES ('EXE-niespojny', ?, NULL, 'known', 'RSET-x', "
             "'{}', '{}', '{}')",
             (przebieg.run_id,),
         )
-    assert blad.value.sqlite_errorname == "SQLITE_CONSTRAINT_UNIQUE"
+    assert blad.value.sqlite_errorname == "SQLITE_CONSTRAINT_CHECK"
+
+
+def test_dwie_proby_tego_samego_odcisku_obie_laduja(
+    magazyn: FindingStore, przebieg: RunRef
+) -> None:
+    """Warunek twardy przełączenia: nowy schemat **przyjmuje** to, co stary odrzucał."""
+    magazyn.save_run(przebieg, (wynik(1.0),), wykonanie("FPR-a"))
+    magazyn.save_run(przebieg, (wynik(1.0),), wykonanie("FPR-a"))
+    magazyn.save_run(przebieg, (wynik(2.0),), wykonanie("FPR-a"))
+
+    proby = magazyn.attempts(przebieg.run_id)
+    assert len(proby) == 3
+    assert len({p.execution_attempt_id for p in proby}) == 3
+    assert {p.execution_fingerprint for p in proby} == {"FPR-a"}
+
+
+def test_zaden_zapis_nie_moze_po_cichu_nie_zapisac(
+    magazyn: FindingStore, przebieg: RunRef
+) -> None:
+    """Zwrotka ``False = pominięto`` zniknęła razem z mechanizmem, który ją produkował.
+
+    Każde wywołanie zwraca ``SaveOutcome`` z identyfikatorem próby — a ten jest zawsze nowy.
+    """
+    wyniki_zapisu = [
+        magazyn.save_run(przebieg, (wynik(),), wykonanie("FPR-a")) for _ in range(3)
+    ]
+    assert all(isinstance(w, SaveOutcome) for w in wyniki_zapisu)
+    assert len({w.execution_attempt_id for w in wyniki_zapisu}) == 3
+    assert len(magazyn.attempts(przebieg.run_id)) == 3
+
+
+def test_blad_zapisu_wynikow_cofa_takze_probe(
+    magazyn: FindingStore, przebieg: RunRef
+) -> None:
+    """**Pinuje stan otwartego kontraktu B-16, nie regułę z karty.**
+
+    Karta §9 żąda ``EVERY_ACTUAL_EXECUTION_ATTEMPT_PERSISTED = true``, a ten test pokazuje
+    przypadek, w którym tego nie spełniamy: zapis idzie w jednej transakcji, więc błąd przy
+    wynikach cofa także wiersz próby. Po drugiej stronie stoi zasada atomowości z nagłówka
+    ``store/findings.py`` — wynik zapisany częściowo byłby śladem, który kłamie.
+
+    Test istnieje po to, żeby rozbieżność była **widoczna i nieprzypadkowa**. Gdy B-16
+    zostanie rozstrzygnięty (rekomendacja: wariant C), ten test ma paść i zostać zastąpiony
+    dowodem trwałości próby.
+    """
+    powtorzony = wynik()
+    with pytest.raises(sqlite3.IntegrityError):
+        magazyn.save_run(przebieg, (powtorzony, powtorzony), wykonanie("FPR-a"))
+
+    assert magazyn.attempts(przebieg.run_id) == ()
+    assert magazyn.executions(przebieg.run_id) == ()
 
 
 def test_inny_odcisk_i_inna_tresc_to_dwa_wykonania(
     magazyn: FindingStore, przebieg: RunRef
 ) -> None:
-    assert magazyn.save_run(przebieg, (wynik(1.0),), wykonanie("FPR-a")) is True
-    assert magazyn.save_run(przebieg, (wynik(2.0),), wykonanie("FPR-b")) is True
+    magazyn.save_run(przebieg, (wynik(1.0),), wykonanie("FPR-a"))
+    magazyn.save_run(przebieg, (wynik(2.0),), wykonanie("FPR-b"))
     assert len(magazyn.executions(przebieg.run_id)) == 2
 
 
 def test_inny_odcisk_i_ta_sama_tresc_to_dwa_wykonania(
     magazyn: FindingStore, przebieg: RunRef
 ) -> None:
-    assert magazyn.save_run(przebieg, (wynik(1.0),), wykonanie("FPR-a")) is True
-    assert magazyn.save_run(przebieg, (wynik(1.0),), wykonanie("FPR-b")) is True
+    magazyn.save_run(przebieg, (wynik(1.0),), wykonanie("FPR-a"))
+    magazyn.save_run(przebieg, (wynik(1.0),), wykonanie("FPR-b"))
     assert len(magazyn.executions(przebieg.run_id)) == 2
 
 
@@ -156,8 +251,8 @@ def test_nieznany_odcisk_nie_zglasza_sprzecznosci_i_mowi_to_wprost(
 ) -> None:
     """Wykonania o nieznanym odcisku współistnieją. Kontrola determinizmu jest dla nich
     wyłączona — i każdy rekord to mówi, zamiast udawać, że odcisk jest znany."""
-    assert magazyn.save_run(przebieg, (wynik(1.0),), wykonanie(None)) is True
-    assert magazyn.save_run(przebieg, (wynik(2.0),), wykonanie(None)) is True
+    magazyn.save_run(przebieg, (wynik(1.0),), wykonanie(None))
+    magazyn.save_run(przebieg, (wynik(2.0),), wykonanie(None))
     zapisane = magazyn.executions(przebieg.run_id)
     assert [w.execution.fingerprint_status for w in zapisane] == [
         FingerprintStatus.UNKNOWN,
@@ -166,11 +261,20 @@ def test_nieznany_odcisk_nie_zglasza_sprzecznosci_i_mowi_to_wprost(
     assert all(w.execution.execution_fingerprint is None for w in zapisane)
 
 
-def test_nieznany_odcisk_z_ta_sama_trescia_to_brak_operacji(
+def test_nieznany_odcisk_z_ta_sama_trescia_tez_zapisuje_probe(
     magazyn: FindingStore, przebieg: RunRef
 ) -> None:
-    assert magazyn.save_run(przebieg, (wynik(),), wykonanie(None)) is True
-    assert magazyn.save_run(przebieg, (wynik(),), wykonanie(None)) is False
+    """**Zastąpiona własność:** drugi zapis o nieznanym odcisku zwracał ``False``.
+
+    **Co ją zastąpiło:** opis wykonania zostaje jeden (ta sama treść, ten sam
+    ``execution_id``), ale próba jest druga. Nieznany odcisk niczego tu nie zmienia:
+    trwałość próby nie zależy od tego, czy potrafimy udowodnić, jakim kodem liczono.
+    """
+    pierwszy = magazyn.save_run(przebieg, (wynik(),), wykonanie(None))
+    drugi = magazyn.save_run(przebieg, (wynik(),), wykonanie(None))
+    assert pierwszy.execution_described_now is True
+    assert drugi.execution_described_now is False
+    assert len(magazyn.attempts(przebieg.run_id)) == 2
 
 
 def test_status_odcisku_nie_rozjezdza_sie_z_odciskiem() -> None:

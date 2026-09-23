@@ -1,5 +1,6 @@
 # Implementuje ZOP-TECH-01 v0.1 pkt 5.4 (trwały zapis FINDINGS), konwencję z CLAUDE.md
-# (SQLite jako magazyn kanoniczny) oraz invariant wykonań z wpisu DT-21.
+# (SQLite jako magazyn kanoniczny) oraz ZOP-XR-V12-R1 kartę wykonawczą §9
+# (EVERY_ACTUAL_EXECUTION_ATTEMPT_PERSISTED) — przełączenie opisane we wpisie DT-21.
 """Schemat magazynu i projekcja kolumn.
 
 ## Klucze wynikają z invariantu, nie odwrotnie
@@ -7,24 +8,32 @@
 | Tabela | Klucz | Co z niego wynika |
 | --- | --- | --- |
 | ``runs`` | ``run_id`` | przebieg: na jakich danych; kolumny wyliczalne z ``run_id`` |
-| ``executions`` | ``execution_id``, ``UNIQUE (run_id, execution_fingerprint)`` | invariant |
+| ``executions`` | ``execution_id`` | **opis** wykonania: przebieg + odcisk + skrót treści |
+| ``execution_attempts`` | ``execution_attempt_id`` | **zdarzenie**: jedna wykonana próba |
 | ``findings`` | ``(execution_id, finding_id)`` | wynik należy do konkretnego wykonania |
 
-``execution_id`` powstaje z ``run_id + execution_fingerprint + result_digest``. Zapis
-wykonania to ``INSERT … ON CONFLICT(execution_id) DO NOTHING``:
+## Co się zmieniło w rundzie V12-R1
 
-- ten sam odcisk i ta sama treść → ten sam ``execution_id`` → brak operacji,
-- ten sam odcisk i inna treść → nowy ``execution_id``, ale naruszone
-  ``UNIQUE (run_id, execution_fingerprint)`` → błąd ograniczenia, czyli sprzeczność,
-- inny odcisk → nowy wiersz.
+Do tej rundy schemat **zabraniał sprzeczności**: ``UNIQUE (run_id, execution_fingerprint)``
+sprawiał, że drugi, inny wynik tego samego przebiegu i odcisku po prostu nie dał się
+zapisać. Wyglądało to na mocny invariant, a było utratą dowodu: przepływ niedeterministyczny
+zostawiał po sobie **jeden** wynik i wyjątek, zamiast dwóch wyników do porównania.
 
-Rozstrzyga **baza**, a nie ``if`` w kodzie: nie da się zapisać dwóch różnych wyników dla tego
-samego przebiegu i odcisku, nawet omijając ``FindingStore``.
+Karta §9 stawia sprawę odwrotnie: ``EVERY_ACTUAL_EXECUTION_ATTEMPT_PERSISTED = true``
+i ``IDENTICAL_ATTEMPT_MAY_NOT_BE_DROPPED_BY_STORAGE_DEDUPLICATION = true``. Najpierw
+zachowujemy oba dowody, dopiero potem klasyfikujemy relację — w
+``ExecutionComparisonRecord`` (karta §11). Dlatego:
 
-**Nieznany odcisk** to ``NULL``. SQLite traktuje ``NULL``-e w ``UNIQUE`` jako różne, więc
-wiele wykonań o nieznanym odcisku współistnieje — kontrola determinizmu jest dla nich
-wyłączona, a ``fingerprint_status = 'unknown'`` mówi to wprost. ``CHECK`` pilnuje, żeby
-status i obecność odcisku się nie rozjechały.
+- ``UNIQUE (run_id, execution_fingerprint)`` **zniknął**,
+- każdy zapis dokłada wiersz do ``execution_attempts`` z własnym, losowym
+  ``execution_attempt_id`` — dwie identyczne próby to dwa wiersze,
+- ``executions`` zostaje tabelą **opisu**: ``execution_id`` powstaje z treści
+  (``run_id + execution_fingerprint + result_digest``), więc ten sam identyfikator znaczy
+  dosłownie ten sam opis. Powtórzenie opisu niczego nie gubi, bo zdarzenie zapisała próba.
+
+**Nieznany odcisk** to ``NULL``; ``CHECK`` pilnuje, żeby status i obecność odcisku się nie
+rozjechały. Porównywanie dwóch ``NULL``-i nigdy nie dowodzi tego samego wykonania — pilnuje
+tego bramka ``compare_fingerprints`` z ``store/attempts.py``, a nie schemat.
 
 ## Payload jest rekordem, kolumny są indeksem
 
@@ -75,9 +84,32 @@ CREATE TABLE IF NOT EXISTS executions (
     code_provenance            TEXT NOT NULL,
     input_provenance           TEXT NOT NULL,
     executed_at                TEXT,
-    UNIQUE (run_id, execution_fingerprint),
     CHECK ((fingerprint_status = 'known') = (execution_fingerprint IS NOT NULL))
 )
+"""
+
+DDL_ATTEMPTS = """
+CREATE TABLE IF NOT EXISTS execution_attempts (
+    execution_attempt_id          TEXT PRIMARY KEY,
+    semantic_run_id               TEXT NOT NULL REFERENCES runs(run_id),
+    semantic_run_profile          TEXT NOT NULL,
+    semantic_run_identity_version TEXT NOT NULL,
+    execution_id                  TEXT NOT NULL REFERENCES executions(execution_id),
+    execution_fingerprint         TEXT,
+    fingerprint_status            TEXT NOT NULL,
+    execution_provenance_ref      TEXT NOT NULL,
+    attempt_started_at            TEXT,
+    attempt_completed_at          TEXT,
+    terminal_status               TEXT NOT NULL,
+    foundation_bind_version       TEXT NOT NULL,
+    payload                       TEXT NOT NULL,
+    CHECK ((fingerprint_status = 'known') = (execution_fingerprint IS NOT NULL))
+)
+"""
+
+DDL_ATTEMPTS_INDEX = """
+CREATE INDEX IF NOT EXISTS attempts_by_run
+    ON execution_attempts (semantic_run_id, execution_fingerprint)
 """
 
 DDL_FINDINGS = """
@@ -126,10 +158,44 @@ def connect(path: str | Path) -> sqlite3.Connection:
         DDL_FINDINGS,
         DDL_FINDINGS_INDEX,
         DDL_FINDINGS_BY_FINDING,
+        DDL_ATTEMPTS,
+        DDL_ATTEMPTS_INDEX,
     ):
         polaczenie.execute(ddl)
+    migrate_executions(polaczenie)
     polaczenie.commit()
     return polaczenie
+
+
+def migrate_executions(connection: sqlite3.Connection) -> bool:
+    """Zdejmuje ``UNIQUE (run_id, execution_fingerprint)`` z istniejącej bazy.
+
+    SQLite nie umie usunąć ograniczenia w miejscu, więc tabelę trzeba przebudować:
+    nowa tabela, przepisanie **wszystkich** wierszy, podmiana nazwy. Zwraca, czy migracja
+    była potrzebna.
+
+    Zero utraty danych jest tu warunkiem, nie życzeniem: historyczne wykonania są dowodem
+    i karta §1 zakazuje ich przeliczania (``HISTORICAL_IDENTITY_REWRITE = false``).
+    Przepisujemy wiersze takimi, jakie są — żaden identyfikator nie jest liczony od nowa.
+    """
+    wiersz = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'executions'"
+    ).fetchone()
+    if wiersz is None or "UNIQUE (run_id, execution_fingerprint)" not in wiersz[0]:
+        return False
+
+    connection.execute("PRAGMA foreign_keys = OFF")
+    try:
+        connection.execute(DDL_EXECUTIONS.replace("executions", "executions_bez_unique", 1))
+        connection.execute(
+            "INSERT INTO executions_bez_unique SELECT * FROM executions"
+        )
+        connection.execute("DROP TABLE executions")
+        connection.execute("ALTER TABLE executions_bez_unique RENAME TO executions")
+    finally:
+        connection.execute("PRAGMA foreign_keys = ON")
+    connection.commit()
+    return True
 
 
 def finding_columns(

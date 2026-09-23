@@ -8,14 +8,18 @@
 wykonania odpowiada na pytanie **„jakim kodem i w jakim środowisku"**. Commit, drzewo gita,
 wydanie i lock zależności to proweniencja wykonania — do ``run_id`` nie wchodzą.
 
-Invariant egzekwowany **ograniczeniami schematu magazynu** (``xray.store.schema``), a nie
-warunkiem w kodzie:
+Wykonanie jest **opisem**: ``execution_id`` powstaje z przebiegu, odcisku i skrótu treści,
+więc ten sam identyfikator znaczy dosłownie ten sam opis.
 
 | run_id | odcisk | wynik | skutek |
 | --- | --- | --- | --- |
-| ten sam | ten sam | ten sam | brak operacji |
-| ten sam | ten sam | inny | ``ConflictingRun``: ten sam kod i środowisko dały inny wynik |
+| ten sam | ten sam | ten sam | ten sam opis; próbę i tak zapisujemy osobno |
+| ten sam | ten sam | inny | dwa opisy obok siebie; relację klasyfikuje porównanie par |
 | ten sam | inny | dowolny | dwa legalne, niezmienne wykonania tego samego przebiegu |
+
+Drugi wiersz był do rundy V12-R1 błędem odmawianym przez ``UNIQUE (run_id,
+execution_fingerprint)``. Karta §9 każe najpierw zachować dowód, więc ograniczenie zniknęło,
+a ocena przeniosła się do ``ExecutionComparisonRecord``.
 
 ## Pułapka, której ten moduł pilnuje konstrukcją
 

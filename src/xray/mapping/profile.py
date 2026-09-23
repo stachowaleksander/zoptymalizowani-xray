@@ -15,7 +15,7 @@ wyłącznie typy proste, a dodatkowo odrzuca powtórzony klucz.
 
 PyYAML przy powtórzonym kluczu **po cichu bierze ostatni**. Profil z dwoma wpisami
 ``unit:`` wyglądałby jak poprawny, a jedno z przypisań zniknęłoby bez śladu. To ta sama
-klasa cichej utraty, przed którą broni ``ConflictingRun`` — więc odrzucamy jawnie.
+klasa cichej utraty, której nie toleruje magazyn — więc odrzucamy jawnie.
 
 ## Kierunek zapisu: pole kontraktu → kolumna klienta
 
@@ -181,9 +181,9 @@ class MappingProfile(BaseModel):
         **Dlaczego skrót w ogóle istnieje:** ``plan_metrics`` nie zmienia treści żadnego
         rekordu, więc nie zmienia ``content_digest``, więc bez tego skrótu nie zmieniałaby
         ``run_id`` — a zmienia wynik, bo dopiero z nią PLAN może służyć jako
-        ``reference_type = plan_budget``. Bez tego ten sam ``run_id`` niósłby inną treść
-        i magazyn ogłosiłby ``ConflictingRun`` z komunikatem „przepływ nie jest
-        deterministyczny", choć jest.
+        ``reference_type = plan_budget``. Bez tego ten sam ``run_id`` niósłby inną treść,
+        a warstwa porównania ogłosiłaby ``NONDETERMINISM_CONFLICT``, choć przepływ jest
+        deterministyczny.
         """
         return compute_id(
             _PROFILE_PREFIX,
@@ -217,7 +217,7 @@ class _StrictLoader(yaml.SafeLoader):
 
     PyYAML domyślnie bierze po cichu ostatni wpis. Profil z dwoma wpisami ``unit:``
     wyglądałby jak poprawny, a jedno z przypisań zniknęłoby bez śladu — ta sama klasa
-    cichej utraty, przed którą broni ``ConflictingRun``.
+    cichej utraty, której nie toleruje magazyn.
 
     Powtórzenie liczy się **w obrębie jednego odwzorowania**: ``unit`` występujące w mapie
     każdej tabeli jest w porządku.
